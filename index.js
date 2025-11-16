@@ -10,14 +10,52 @@ const API_BASE = "https://api.football-data.org/v4";
 app.use(cors());
 app.use(express.json());
 
+// Echipe considerate puternice (primele care îți vin în minte, putem extinde lista)
+const BIG_TEAMS = [
+  "Real Madrid",
+  "FC Barcelona",
+  "Atletico Madrid",
+  "Manchester City FC",
+  "Liverpool FC",
+  "Arsenal FC",
+  "Manchester United FC",
+  "Chelsea FC",
+  "FC Bayern München",
+  "Borussia Dortmund",
+  "Paris Saint-Germain FC",
+  "Juventus FC",
+  "FC Internazionale Milano",
+  "AC Milan",
+  "SSC Napoli",
+];
+
 // Root simplu, pentru verificare
 app.get("/", (req, res) => {
   res.send("Football backend OK");
 });
 
-// Helper mic ca să nu ieșim din 0-100
+// Helper: limitează o valoare între min și max
 function clamp(value, min, max) {
   return Math.min(max, Math.max(min, value));
+}
+
+// Random determinist bazat pe text (seed)
+function pseudoRandom(seed) {
+  let h = 0;
+  for (let i = 0; i < seed.length; i++) {
+    h = Math.imul(31, h) + seed.charCodeAt(i);
+    h |= 0;
+  }
+  return (h >>> 0) / 4294967295; // 0-1
+}
+
+// Obținem un random stabil pentru un anumit meci + „cheie”
+function prngForMatch(match, key) {
+  const homeName = match?.homeTeam?.name || "";
+  const awayName = match?.awayTeam?.name || "";
+  const id = match?.id || 0;
+  const seed = `${id}-${homeName}-${awayName}-${key}`;
+  return pseudoRandom(seed);
 }
 
 // Helper: generează o predicție coerentă pentru un meci
@@ -25,32 +63,49 @@ function generatePrediction(match) {
   const homeName = match?.homeTeam?.name || "";
   const awayName = match?.awayTeam?.name || "";
 
-  // Avantaj de bază pentru gazde
-  let homeAdvantage = 0.10; // 10%
+  // Avantaj gazde
+  let homeAdvantage = 0.15; // 15%
 
-  // Mică biasare după lungimea numelui (doar ca exemplu, ca să nu fie 100% random)
-  if (homeName.length > awayName.length + 3) {
-    homeAdvantage += 0.03;
-  } else if (awayName.length > homeName.length + 3) {
-    homeAdvantage -= 0.03;
-  }
+  // Forță de bază pentru echipe
+  let strengthHome = 1 + homeAdvantage;
+  let strengthAway = 1;
 
-  // Probabilități brute 1X2 înainte de normalizare
-  let rawHome = 0.45 + homeAdvantage + (Math.random() - 0.5) * 0.10;
-  let rawAway = 0.30 - homeAdvantage + (Math.random() - 0.5) * 0.10;
-  let rawDraw = 0.25 + (Math.random() - 0.5) * 0.05;
+  // Boost pentru echipe mari
+  if (BIG_TEAMS.includes(homeName)) strengthHome += 0.35;
+  if (BIG_TEAMS.includes(awayName)) strengthAway += 0.35;
+
+  // Cât de apropiate ca nivel par echipele
+  const strengthDiff = Math.abs(strengthHome - strengthAway); // 0 = egale
+  const closeness = clamp(1 - strengthDiff, 0, 1);
+
+  // Probabilitate de egal mai mare când echipele sunt apropiate
+  const baseDrawProb = 0.18 + 0.18 * closeness; // între ~18% și ~36%
+  const nonDrawProb = 1 - baseDrawProb;
+  const sumStrength = strengthHome + strengthAway;
+
+  let rawHome = (strengthHome / sumStrength) * nonDrawProb;
+  let rawAway = (strengthAway / sumStrength) * nonDrawProb;
+  let rawDraw = baseDrawProb;
+
+  // Mic zgomot determinist
+  const noiseHome = (prngForMatch(match, "home") - 0.5) * 0.08;
+  const noiseAway = (prngForMatch(match, "away") - 0.5) * 0.08;
+  const noiseDraw = (prngForMatch(match, "draw") - 0.5) * 0.05;
+
+  rawHome += noiseHome;
+  rawAway += noiseAway;
+  rawDraw += noiseDraw;
 
   // Să nu fie sub 5% niciuna
-  rawHome = Math.max(rawHome, 0.05);
-  rawAway = Math.max(rawAway, 0.05);
-  rawDraw = Math.max(rawDraw, 0.05);
+  rawHome = clamp(rawHome, 0.05, 0.9);
+  rawAway = clamp(rawAway, 0.05, 0.9);
+  rawDraw = clamp(rawDraw, 0.05, 0.9);
 
   // Normalizare la 100%
-  const total = rawHome + rawDraw + rawAway;
-
-  let probHome = Math.round((rawHome / total) * 100);
-  let probDraw = Math.round((rawDraw / total) * 100);
-  let probAway = Math.round((rawAway / total) * 100);
+  const totalRaw = rawHome + rawDraw + rawAway;
+  let probHome = Math.round((rawHome / totalRaw) * 100);
+  let probDraw = Math.round((rawDraw / totalRaw) * 100);
+  let probAway = Math.round((rawAway / totalRaw) * 100);
 
   // Ajustare mică să fie exact 100%
   let sum = probHome + probDraw + probAway;
@@ -65,75 +120,90 @@ function generatePrediction(match) {
     }
   }
 
-  const arr = [probHome, probDraw, probAway];
-  const maxProb = Math.max(...arr);
+  const arr = [
+    { label: "HOME", value: probHome },
+    { label: "DRAW", value: probDraw },
+    { label: "AWAY", value: probAway },
+  ];
 
-  let mainPick = "HOME";
-  if (maxProb === probDraw) mainPick = "DRAW";
-  if (maxProb === probAway) mainPick = "AWAY";
+  arr.sort((a, b) => b.value - a.value);
+  const mainPick = arr[0].label;
 
-  const confidence = maxProb; // 0-100, îl folosim și la alte piețe
+  // Confidence din diferența între prima și a doua probabilitate
+  const margin = (arr[0].value - arr[1].value) / 100; // 0-1
+  let confidence = 55 + margin * 120; // între ~55 și ~75-80 tipic
+  // boost mic pentru echipe mari foarte favorite
+  if (
+    mainPick === "HOME" &&
+    BIG_TEAMS.includes(homeName) &&
+    probHome >= 60
+  ) {
+    confidence += 5;
+  }
+  confidence = clamp(Math.round(confidence), 50, 95);
 
-  // Index de atac, între 0 și 1, în funcție de cât de mari sunt șansele de 1 sau 2
+  // Index atac după șansele de victorie ale echipelor
   const attackIndex = (probHome + probAway) / 200; // 0-1
 
   // Goluri: peste/sub 2.5 + BTTS
-  let goalsOver25 =
-    35 + attackIndex * 40 + (confidence - 50) * 0.3 + (Math.random() - 0.5) * 10;
-  goalsOver25 = clamp(Math.round(goalsOver25), 20, 90);
+  const goalsBase =
+    0.45 + attackIndex * 0.35; // 45% la meci echilibrat, mai mult la meci ofensiv
+  const goalsNoise = (prngForMatch(match, "goals") - 0.5) * 0.15;
+  let goalsOver25 = clamp(goalsBase + goalsNoise, 0.25, 0.88);
+  let goalsUnder25 = 1 - goalsOver25;
 
-  let goalsUnder25 = 100 - goalsOver25;
-
-  let bttsYes =
-    30 + attackIndex * 40 + (confidence - 50) * 0.2 + (Math.random() - 0.5) * 10;
-  bttsYes = clamp(Math.round(bttsYes), 15, 85);
-
-  let bttsNo = 100 - bttsYes;
+  let bttsBase = 0.40 + attackIndex * 0.30;
+  const bttsNoise = (prngForMatch(match, "btts") - 0.5) * 0.15;
+  let bttsYes = clamp(bttsBase + bttsNoise, 0.20, 0.85);
+  let bttsNo = 1 - bttsYes;
 
   // Cornere: mai mari când atacul e mare
-  let cornersOver =
-    40 + attackIndex * 35 + (confidence - 50) * 0.2 + (Math.random() - 0.5) * 8;
-  cornersOver = clamp(Math.round(cornersOver), 25, 90);
-  let cornersUnder = 100 - cornersOver;
+  let cornersBase = 0.45 + attackIndex * 0.30;
+  const cornersNoise = (prngForMatch(match, "corners") - 0.5) * 0.12;
+  let cornersOver = clamp(cornersBase + cornersNoise, 0.25, 0.90);
+  let cornersUnder = 1 - cornersOver;
 
-  // Cartonașe: destul de echilibrate, ușor random
-  let cardsOver =
-    45 + (Math.random() - 0.5) * 20 + (attackIndex - 0.5) * 15;
-  cardsOver = clamp(Math.round(cardsOver), 20, 90);
-  let cardsUnder = 100 - cardsOver;
+  // Cartonașe: destul de echilibrate, ușor influențate de „closeness”
+  let cardsBase = 0.45 + (1 - closeness) * 0.15; // meciuri dezechilibrate tind să fie mai dure
+  const cardsNoise = (prngForMatch(match, "cards") - 0.5) * 0.18;
+  let cardsOver = clamp(cardsBase + cardsNoise, 0.20, 0.90);
+  let cardsUnder = 1 - cardsOver;
 
-  // Faulturi: decidem cine are "mai multe faulturi"
-  let foulsHomeMore = 50 + (Math.random() - 0.5) * 20;
-  foulsHomeMore = clamp(Math.round(foulsHomeMore), 30, 70);
-  let foulsAwayMore = 100 - foulsHomeMore;
+  // Faulturi: mic avantaj random, dar stabil
+  let foulsHomeMore =
+    0.50 +
+    (prngForMatch(match, "fouls-home") - 0.5) * 0.20 +
+    (strengthHome - strengthAway) * 0.05;
+  foulsHomeMore = clamp(foulsHomeMore, 0.30, 0.70);
+  let foulsAwayMore = 1 - foulsHomeMore;
 
   return {
     probHome,
     probDraw,
     probAway,
-    mainPick,   // "HOME" | "DRAW" | "AWAY"
+    mainPick, // "HOME" | "DRAW" | "AWAY"
     confidence, // 0-100
 
     goals: {
-      over25: goalsOver25,
-      under25: goalsUnder25,
-      bttsYes,
-      bttsNo,
+      over25: Math.round(goalsOver25 * 100),
+      under25: Math.round(goalsUnder25 * 100),
+      bttsYes: Math.round(bttsYes * 100),
+      bttsNo: Math.round(bttsNo * 100),
     },
 
     corners: {
-      over9_5: cornersOver,
-      under9_5: cornersUnder,
+      over9_5: Math.round(cornersOver * 100),
+      under9_5: Math.round(cornersUnder * 100),
     },
 
     cards: {
-      over4_5: cardsOver,
-      under4_5: cardsUnder,
+      over4_5: Math.round(cardsOver * 100),
+      under4_5: Math.round(cardsUnder * 100),
     },
 
     fouls: {
-      homeMore: foulsHomeMore,
-      awayMore: foulsAwayMore,
+      homeMore: Math.round(foulsHomeMore * 100),
+      awayMore: Math.round(foulsAwayMore * 100),
     },
   };
 }
@@ -156,7 +226,10 @@ app.get("/api/competitions", async (req, res) => {
       console.error("Eroare la /competitions:", response.status, text);
       return res
         .status(response.status)
-        .json({ error: "Eroare de la football-data.org", status: response.status });
+        .json({
+          error: "Eroare de la football-data.org",
+          status: response.status,
+        });
     }
 
     const data = await response.json();
@@ -179,7 +252,9 @@ app.get("/api/matches", async (req, res) => {
   try {
     const competitionId = req.query.competitionId;
     if (!competitionId) {
-      return res.status(400).json({ error: "Lipsește parametrul competitionId" });
+      return res
+        .status(400)
+        .json({ error: "Lipsește parametrul competitionId" });
     }
 
     if (!API_KEY) {
@@ -206,7 +281,10 @@ app.get("/api/matches", async (req, res) => {
       console.error("Eroare la /matches:", response.status, text);
       return res
         .status(response.status)
-        .json({ error: "Eroare de la football-data.org", status: response.status });
+        .json({
+          error: "Eroare de la football-data.org",
+          status: response.status,
+        });
     }
 
     const data = await response.json();
