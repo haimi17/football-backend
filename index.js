@@ -31,28 +31,26 @@ const BIG_TEAMS = [
 
 // Cache simplu în memorie
 const standingsCache = new Map(); // key: competitionId -> { timestamp, strengths }
-const matchesCache = new Map(); // key: competitionId -> { timestamp, matches }
+const matchesCache = new Map();   // key: competitionId -> { timestamp, matches }
+const formCache = new Map();      // key: competitionId -> { timestamp, formStats }
 
 app.get("/", (req, res) => {
   res.send("Football backend OK");
 });
 
-// Helper: limitează o valoare între min și max
 function clamp(value, min, max) {
   return Math.min(max, Math.max(min, value));
 }
 
-// Random determinist bazat pe text (seed)
 function pseudoRandom(seed) {
   let h = 0;
   for (let i = 0; i < seed.length; i++) {
     h = Math.imul(31, h) + seed.charCodeAt(i);
     h |= 0;
   }
-  return (h >>> 0) / 4294967295; // 0-1
+  return (h >>> 0) / 4294967295;
 }
 
-// Obținem un random stabil pentru un anumit meci + "cheie"
 function prngForMatch(match, key) {
   const homeName = match?.homeTeam?.name || "";
   const awayName = match?.awayTeam?.name || "";
@@ -61,11 +59,11 @@ function prngForMatch(match, key) {
   return pseudoRandom(seed);
 }
 
-// Citește și cache-uiește clasamentul pentru o competiție
+// standings -> strength per team
 async function getTeamStrengths(competitionId) {
   const cached = standingsCache.get(competitionId);
   const now = Date.now();
-  const TTL = 12 * 60 * 60 * 1000; // 12 ore
+  const TTL = 12 * 60 * 60 * 1000;
 
   if (cached && now - cached.timestamp < TTL) {
     return cached.strengths;
@@ -99,7 +97,6 @@ async function getTeamStrengths(competitionId) {
 
       const position = row.position ?? index + 1;
 
-      // Topul are coeficient mai mare, coada mai mic
       const factor =
         1.15 - ((position - 1) / Math.max(n - 1, 1)) * 0.3; // 1.15 -> 0.85
       strengths[teamName] = factor;
@@ -117,30 +114,168 @@ async function getTeamStrengths(competitionId) {
   }
 }
 
-// Generează predicție coerentă pentru un meci
-function generatePrediction(match, strengths = {}) {
+// formă recentă: ultimele ~60 zile, acasă / deplasare
+async function getTeamForm(competitionId) {
+  const cached = formCache.get(competitionId);
+  const now = Date.now();
+  const TTL = 6 * 60 * 60 * 1000;
+
+  if (cached && now - cached.timestamp < TTL) {
+    return cached.formStats;
+  }
+
+  if (!API_KEY) {
+    return {};
+  }
+
+  try {
+    const today = new Date();
+    const to = new Date(today);
+    to.setDate(today.getDate() - 1);
+    const from = new Date(today);
+    from.setDate(today.getDate() - 60);
+
+    const dateFrom = from.toISOString().slice(0, 10);
+    const dateTo = to.toISOString().slice(0, 10);
+
+    const url = `${API_BASE}/competitions/${competitionId}/matches?dateFrom=${dateFrom}&dateTo=${dateTo}`;
+    const response = await fetch(url, {
+      headers: { "X-Auth-Token": API_KEY },
+    });
+
+    if (!response.ok) {
+      const text = await response.text();
+      console.error("Eroare la /matches (form):", response.status, text);
+      return {};
+    }
+
+    const data = await response.json();
+    const matches = data.matches || [];
+
+    const stats = {};
+
+    function ensureTeam(name) {
+      if (!stats[name]) {
+        stats[name] = {
+          home: { played: 0, points: 0, gf: 0, ga: 0 },
+          away: { played: 0, points: 0, gf: 0, ga: 0 },
+        };
+      }
+      return stats[name];
+    }
+
+    for (const m of matches) {
+      if (m.status !== "FINISHED") continue;
+
+      const homeName = m.homeTeam?.name;
+      const awayName = m.awayTeam?.name;
+      if (!homeName || !awayName) continue;
+
+      const ft = m.score?.fullTime || {};
+      const gh = typeof ft.home === "number" ? ft.home : null;
+      const ga = typeof ft.away === "number" ? ft.away : null;
+      if (gh === null || ga === null) continue;
+
+      const homeStats = ensureTeam(homeName).home;
+      const awayStats = ensureTeam(awayName).away;
+
+      homeStats.played += 1;
+      homeStats.gf += gh;
+      homeStats.ga += ga;
+
+      awayStats.played += 1;
+      awayStats.gf += ga;
+      awayStats.ga += gh;
+
+      if (gh > ga) {
+        homeStats.points += 3;
+      } else if (gh < ga) {
+        awayStats.points += 3;
+      } else {
+        homeStats.points += 1;
+        awayStats.points += 1;
+      }
+    }
+
+    const formStats = {};
+
+    Object.entries(stats).forEach(([team, v]) => {
+      const home = v.home;
+      const away = v.away;
+
+      const homePpm = home.played ? home.points / home.played : 0;
+      const awayPpm = away.played ? away.points / away.played : 0;
+      const homeGf = home.played ? home.gf / home.played : 0;
+      const awayGf = away.played ? away.gf / away.played : 0;
+      const homeGa = home.played ? home.ga / home.played : 0;
+      const awayGa = away.played ? away.ga / away.played : 0;
+
+      const totalPlayed = home.played + away.played;
+      const totalPoints = home.points + away.points;
+      const totalGf = home.gf + away.gf;
+      const totalGa = home.ga + away.ga;
+
+      const overallPpm = totalPlayed ? totalPoints / totalPlayed : 0;
+      const overallGf = totalPlayed ? totalGf / totalPlayed : 0;
+      const overallGa = totalPlayed ? totalGa / totalPlayed : 0;
+
+      formStats[team] = {
+        homePpm,
+        awayPpm,
+        overallPpm,
+        homeGf,
+        awayGf,
+        overallGf,
+        homeGa,
+        awayGa,
+        overallGa,
+      };
+    });
+
+    formCache.set(competitionId, { timestamp: now, formStats });
+
+    return formStats;
+  } catch (err) {
+    console.error("Eroare server getTeamForm:", err);
+    return {};
+  }
+}
+
+function generatePrediction(match, strengths = {}, formStats = {}) {
   const homeName = match?.homeTeam?.name || "";
   const awayName = match?.awayTeam?.name || "";
 
-  // Avantaj gazde
-  const homeAdvantage = 0.15;
-
-  // Forță de bază din clasament (sau 1 dacă nu există date)
   const tableStrengthHome = strengths[homeName] ?? 1;
   const tableStrengthAway = strengths[awayName] ?? 1;
 
-  let strengthHome = tableStrengthHome + homeAdvantage;
+  const formHome = formStats[homeName] || {};
+  const formAway = formStats[awayName] || {};
+
+  const homePpm =
+    formHome.homePpm ?? formHome.overallPpm ?? 1.5;
+  const awayPpm =
+    formAway.awayPpm ?? formAway.overallPpm ?? 1.5;
+
+  const ppmMid = 1.5;
+
+  let strengthHome = tableStrengthHome;
   let strengthAway = tableStrengthAway;
 
-  // Boost pentru echipe mari
+  const homeFormFactor = clamp(1 + (homePpm - ppmMid) * 0.12, 0.75, 1.25);
+  const awayFormFactor = clamp(1 + (awayPpm - ppmMid) * 0.12, 0.75, 1.25);
+
+  strengthHome *= homeFormFactor;
+  strengthAway *= awayFormFactor;
+
+  const homeAdvantage = 0.15;
+  strengthHome += homeAdvantage;
+
   if (BIG_TEAMS.includes(homeName)) strengthHome += 0.25;
   if (BIG_TEAMS.includes(awayName)) strengthAway += 0.25;
 
-  // Cât de apropiate ca nivel par echipele
   const strengthDiff = Math.abs(strengthHome - strengthAway);
   const closeness = clamp(1 - strengthDiff, 0, 1);
 
-  // Probabilitate de egal mai mare când echipele sunt apropiate
   const baseDrawProb = 0.18 + 0.18 * closeness;
   const nonDrawProb = 1 - baseDrawProb;
   const sumStrength = strengthHome + strengthAway;
@@ -149,7 +284,6 @@ function generatePrediction(match, strengths = {}) {
   let rawAway = (strengthAway / sumStrength) * nonDrawProb;
   let rawDraw = baseDrawProb;
 
-  // Mic zgomot determinist
   const noiseHome = (prngForMatch(match, "home") - 0.5) * 0.06;
   const noiseAway = (prngForMatch(match, "away") - 0.5) * 0.06;
   const noiseDraw = (prngForMatch(match, "draw") - 0.5) * 0.04;
@@ -158,18 +292,15 @@ function generatePrediction(match, strengths = {}) {
   rawAway += noiseAway;
   rawDraw += noiseDraw;
 
-  // Să nu fie sub 5% niciuna
   rawHome = clamp(rawHome, 0.05, 0.9);
   rawAway = clamp(rawAway, 0.05, 0.9);
   rawDraw = clamp(rawDraw, 0.05, 0.9);
 
-  // Normalizare la 100%
   const totalRaw = rawHome + rawDraw + rawAway;
   let probHome = Math.round((rawHome / totalRaw) * 100);
   let probDraw = Math.round((rawDraw / totalRaw) * 100);
   let probAway = Math.round((rawAway / totalRaw) * 100);
 
-  // Ajustare să fie exact 100%
   let sum = probHome + probDraw + probAway;
   if (sum !== 100) {
     const diff = 100 - sum;
@@ -187,11 +318,9 @@ function generatePrediction(match, strengths = {}) {
     { label: "DRAW", value: probDraw },
     { label: "AWAY", value: probAway },
   ];
-
   arr.sort((a, b) => b.value - a.value);
   const mainPick = arr[0].label;
 
-  // Confidence din diferența între prima și a doua probabilitate
   const margin = (arr[0].value - arr[1].value) / 100;
   let confidence = 55 + margin * 120;
   if (
@@ -203,8 +332,23 @@ function generatePrediction(match, strengths = {}) {
   }
   confidence = clamp(Math.round(confidence), 50, 95);
 
-  // Index atac după șansele de victorie
-  const attackIndex = (probHome + probAway) / 200;
+  const overallGfHome =
+    formHome.overallGf ?? formHome.homeGf ?? 1.2;
+  const overallGfAway =
+    formAway.overallGf ?? formAway.awayGf ?? 1.2;
+
+  const attackIndexBase = (probHome + probAway) / 200;
+  const attackGoalsFactor = clamp(
+    (overallGfHome + overallGfAway) / 4,
+    0.6,
+    1.4
+  );
+  const attackIndex = clamp(
+    attackIndexBase * attackGoalsFactor,
+    0,
+    1
+  );
+
   const goalsBase = 0.45 + attackIndex * 0.35;
   const goalsNoise = (prngForMatch(match, "goals") - 0.5) * 0.15;
   let goalsOver25 = clamp(goalsBase + goalsNoise, 0.25, 0.88);
@@ -220,7 +364,18 @@ function generatePrediction(match, strengths = {}) {
   let cornersOver = clamp(cornersBase + cornersNoise, 0.25, 0.90);
   let cornersUnder = 1 - cornersOver;
 
-  let cardsBase = 0.45 + (1 - closeness) * 0.15;
+  const overallGaHome =
+    formHome.overallGa ?? formHome.homeGa ?? 1.2;
+  const overallGaAway =
+    formAway.overallGa ?? formAway.awayGa ?? 1.2;
+  const defenseRoughness = clamp(
+    (overallGaHome + overallGaAway) / 4,
+    0.6,
+    1.4
+  );
+
+  let cardsBase = 0.45 + (1 - closeness) * 0.12;
+  cardsBase *= defenseRoughness;
   const cardsNoise = (prngForMatch(match, "cards") - 0.5) * 0.18;
   let cardsOver = clamp(cardsBase + cardsNoise, 0.20, 0.90);
   let cardsUnder = 1 - cardsOver;
@@ -231,6 +386,12 @@ function generatePrediction(match, strengths = {}) {
     (strengthHome - strengthAway) * 0.05;
   foulsHomeMore = clamp(foulsHomeMore, 0.30, 0.70);
   let foulsAwayMore = 1 - foulsHomeMore;
+
+  let shotsBase = 0.48 + attackIndex * 0.35;
+  shotsBase *= attackGoalsFactor;
+  const shotsNoise = (prngForMatch(match, "shots") - 0.5) * 0.15;
+  let shotsOver = clamp(shotsBase + shotsNoise, 0.30, 0.92);
+  let shotsUnder = 1 - shotsOver;
 
   return {
     probHome,
@@ -260,10 +421,14 @@ function generatePrediction(match, strengths = {}) {
       homeMore: Math.round(foulsHomeMore * 100),
       awayMore: Math.round(foulsAwayMore * 100),
     },
+
+    shots: {
+      totalOver: Math.round(shotsOver * 100),
+      totalUnder: Math.round(shotsUnder * 100),
+    },
   };
 }
 
-// 1. Lista de competiții
 app.get("/api/competitions", async (req, res) => {
   try {
     if (!API_KEY) {
@@ -301,7 +466,6 @@ app.get("/api/competitions", async (req, res) => {
   }
 });
 
-// 2. Meciuri pentru competiția aleasă, în următoarele 7 zile
 app.get("/api/matches", async (req, res) => {
   try {
     const competitionId = req.query.competitionId;
@@ -317,10 +481,9 @@ app.get("/api/matches", async (req, res) => {
         .json({ error: "FOOTBALL_DATA_KEY lipsă în backend" });
     }
 
-    // Cache pentru meciuri (stabilitate la refresh)
     const cached = matchesCache.get(competitionId);
     const now = Date.now();
-    const TTL = 10 * 60 * 1000; // 10 minute
+    const TTL = 10 * 60 * 1000;
 
     if (cached && now - cached.timestamp < TTL) {
       return res.json(cached.matches);
@@ -329,7 +492,7 @@ app.get("/api/matches", async (req, res) => {
     const today = new Date();
     const dateFrom = today.toISOString().slice(0, 10);
 
-    const to = new Date();
+    const to = new Date(today);
     to.setDate(today.getDate() + 7);
     const dateTo = to.toISOString().slice(0, 10);
 
@@ -353,9 +516,10 @@ app.get("/api/matches", async (req, res) => {
     const data = await response.json();
 
     const strengths = await getTeamStrengths(competitionId);
+    const formStats = await getTeamForm(competitionId);
 
     const matches = (data.matches || []).map((m) => {
-      const prediction = generatePrediction(m, strengths);
+      const prediction = generatePrediction(m, strengths, formStats);
 
       return {
         id: m.id,
