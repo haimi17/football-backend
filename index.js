@@ -10,7 +10,7 @@ const API_BASE = "https://api.football-data.org/v4";
 app.use(cors());
 app.use(express.json());
 
-// Echipe considerate puternice (primele care îți vin în minte, putem extinde lista)
+// Echipe considerate puternice
 const BIG_TEAMS = [
   "Real Madrid",
   "FC Barcelona",
@@ -29,7 +29,10 @@ const BIG_TEAMS = [
   "SSC Napoli",
 ];
 
-// Root simplu, pentru verificare
+// Cache simplu în memorie
+const standingsCache = new Map(); // key: competitionId -> { timestamp, strengths }
+const matchesCache = new Map(); // key: competitionId -> { timestamp, matches }
+
 app.get("/", (req, res) => {
   res.send("Football backend OK");
 });
@@ -49,7 +52,7 @@ function pseudoRandom(seed) {
   return (h >>> 0) / 4294967295; // 0-1
 }
 
-// Obținem un random stabil pentru un anumit meci + „cheie”
+// Obținem un random stabil pentru un anumit meci + "cheie"
 function prngForMatch(match, key) {
   const homeName = match?.homeTeam?.name || "";
   const awayName = match?.awayTeam?.name || "";
@@ -58,28 +61,87 @@ function prngForMatch(match, key) {
   return pseudoRandom(seed);
 }
 
-// Helper: generează o predicție coerentă pentru un meci
-function generatePrediction(match) {
+// Citește și cache-uiește clasamentul pentru o competiție
+async function getTeamStrengths(competitionId) {
+  const cached = standingsCache.get(competitionId);
+  const now = Date.now();
+  const TTL = 12 * 60 * 60 * 1000; // 12 ore
+
+  if (cached && now - cached.timestamp < TTL) {
+    return cached.strengths;
+  }
+
+  if (!API_KEY) {
+    return {};
+  }
+
+  try {
+    const url = `${API_BASE}/competitions/${competitionId}/standings`;
+    const response = await fetch(url, {
+      headers: { "X-Auth-Token": API_KEY },
+    });
+
+    if (!response.ok) {
+      const text = await response.text();
+      console.error("Eroare la /standings:", response.status, text);
+      return {};
+    }
+
+    const data = await response.json();
+    const table = data.standings?.[0]?.table || [];
+
+    const strengths = {};
+    const n = table.length || 1;
+
+    table.forEach((row, index) => {
+      const teamName = row.team?.name;
+      if (!teamName) return;
+
+      const position = row.position ?? index + 1;
+
+      // Topul are coeficient mai mare, coada mai mic
+      const factor =
+        1.15 - ((position - 1) / Math.max(n - 1, 1)) * 0.3; // 1.15 -> 0.85
+      strengths[teamName] = factor;
+    });
+
+    standingsCache.set(competitionId, {
+      timestamp: now,
+      strengths,
+    });
+
+    return strengths;
+  } catch (err) {
+    console.error("Eroare server getTeamStrengths:", err);
+    return {};
+  }
+}
+
+// Generează predicție coerentă pentru un meci
+function generatePrediction(match, strengths = {}) {
   const homeName = match?.homeTeam?.name || "";
   const awayName = match?.awayTeam?.name || "";
 
   // Avantaj gazde
-  let homeAdvantage = 0.15; // 15%
+  const homeAdvantage = 0.15;
 
-  // Forță de bază pentru echipe
-  let strengthHome = 1 + homeAdvantage;
-  let strengthAway = 1;
+  // Forță de bază din clasament (sau 1 dacă nu există date)
+  const tableStrengthHome = strengths[homeName] ?? 1;
+  const tableStrengthAway = strengths[awayName] ?? 1;
+
+  let strengthHome = tableStrengthHome + homeAdvantage;
+  let strengthAway = tableStrengthAway;
 
   // Boost pentru echipe mari
-  if (BIG_TEAMS.includes(homeName)) strengthHome += 0.35;
-  if (BIG_TEAMS.includes(awayName)) strengthAway += 0.35;
+  if (BIG_TEAMS.includes(homeName)) strengthHome += 0.25;
+  if (BIG_TEAMS.includes(awayName)) strengthAway += 0.25;
 
   // Cât de apropiate ca nivel par echipele
-  const strengthDiff = Math.abs(strengthHome - strengthAway); // 0 = egale
+  const strengthDiff = Math.abs(strengthHome - strengthAway);
   const closeness = clamp(1 - strengthDiff, 0, 1);
 
   // Probabilitate de egal mai mare când echipele sunt apropiate
-  const baseDrawProb = 0.18 + 0.18 * closeness; // între ~18% și ~36%
+  const baseDrawProb = 0.18 + 0.18 * closeness;
   const nonDrawProb = 1 - baseDrawProb;
   const sumStrength = strengthHome + strengthAway;
 
@@ -88,9 +150,9 @@ function generatePrediction(match) {
   let rawDraw = baseDrawProb;
 
   // Mic zgomot determinist
-  const noiseHome = (prngForMatch(match, "home") - 0.5) * 0.08;
-  const noiseAway = (prngForMatch(match, "away") - 0.5) * 0.08;
-  const noiseDraw = (prngForMatch(match, "draw") - 0.5) * 0.05;
+  const noiseHome = (prngForMatch(match, "home") - 0.5) * 0.06;
+  const noiseAway = (prngForMatch(match, "away") - 0.5) * 0.06;
+  const noiseDraw = (prngForMatch(match, "draw") - 0.5) * 0.04;
 
   rawHome += noiseHome;
   rawAway += noiseAway;
@@ -107,7 +169,7 @@ function generatePrediction(match) {
   let probDraw = Math.round((rawDraw / totalRaw) * 100);
   let probAway = Math.round((rawAway / totalRaw) * 100);
 
-  // Ajustare mică să fie exact 100%
+  // Ajustare să fie exact 100%
   let sum = probHome + probDraw + probAway;
   if (sum !== 100) {
     const diff = 100 - sum;
@@ -130,9 +192,8 @@ function generatePrediction(match) {
   const mainPick = arr[0].label;
 
   // Confidence din diferența între prima și a doua probabilitate
-  const margin = (arr[0].value - arr[1].value) / 100; // 0-1
-  let confidence = 55 + margin * 120; // între ~55 și ~75-80 tipic
-  // boost mic pentru echipe mari foarte favorite
+  const margin = (arr[0].value - arr[1].value) / 100;
+  let confidence = 55 + margin * 120;
   if (
     mainPick === "HOME" &&
     BIG_TEAMS.includes(homeName) &&
@@ -142,12 +203,9 @@ function generatePrediction(match) {
   }
   confidence = clamp(Math.round(confidence), 50, 95);
 
-  // Index atac după șansele de victorie ale echipelor
-  const attackIndex = (probHome + probAway) / 200; // 0-1
-
-  // Goluri: peste/sub 2.5 + BTTS
-  const goalsBase =
-    0.45 + attackIndex * 0.35; // 45% la meci echilibrat, mai mult la meci ofensiv
+  // Index atac după șansele de victorie
+  const attackIndex = (probHome + probAway) / 200;
+  const goalsBase = 0.45 + attackIndex * 0.35;
   const goalsNoise = (prngForMatch(match, "goals") - 0.5) * 0.15;
   let goalsOver25 = clamp(goalsBase + goalsNoise, 0.25, 0.88);
   let goalsUnder25 = 1 - goalsOver25;
@@ -157,19 +215,16 @@ function generatePrediction(match) {
   let bttsYes = clamp(bttsBase + bttsNoise, 0.20, 0.85);
   let bttsNo = 1 - bttsYes;
 
-  // Cornere: mai mari când atacul e mare
   let cornersBase = 0.45 + attackIndex * 0.30;
   const cornersNoise = (prngForMatch(match, "corners") - 0.5) * 0.12;
   let cornersOver = clamp(cornersBase + cornersNoise, 0.25, 0.90);
   let cornersUnder = 1 - cornersOver;
 
-  // Cartonașe: destul de echilibrate, ușor influențate de „closeness”
-  let cardsBase = 0.45 + (1 - closeness) * 0.15; // meciuri dezechilibrate tind să fie mai dure
+  let cardsBase = 0.45 + (1 - closeness) * 0.15;
   const cardsNoise = (prngForMatch(match, "cards") - 0.5) * 0.18;
   let cardsOver = clamp(cardsBase + cardsNoise, 0.20, 0.90);
   let cardsUnder = 1 - cardsOver;
 
-  // Faulturi: mic avantaj random, dar stabil
   let foulsHomeMore =
     0.50 +
     (prngForMatch(match, "fouls-home") - 0.5) * 0.20 +
@@ -181,8 +236,8 @@ function generatePrediction(match) {
     probHome,
     probDraw,
     probAway,
-    mainPick, // "HOME" | "DRAW" | "AWAY"
-    confidence, // 0-100
+    mainPick,
+    confidence,
 
     goals: {
       over25: Math.round(goalsOver25 * 100),
@@ -208,7 +263,7 @@ function generatePrediction(match) {
   };
 }
 
-// 1. Lista de competiții (ligile importante)
+// 1. Lista de competiții
 app.get("/api/competitions", async (req, res) => {
   try {
     if (!API_KEY) {
@@ -234,7 +289,6 @@ app.get("/api/competitions", async (req, res) => {
 
     const data = await response.json();
 
-    // păstrăm doar câteva competiții cunoscute
     const allowedCodes = ["CL", "PL", "PD", "SA", "BL1", "FL1", "DED", "PPL"];
     const filtered = (data.competitions || []).filter((c) =>
       allowedCodes.includes(c.code)
@@ -263,6 +317,15 @@ app.get("/api/matches", async (req, res) => {
         .json({ error: "FOOTBALL_DATA_KEY lipsă în backend" });
     }
 
+    // Cache pentru meciuri (stabilitate la refresh)
+    const cached = matchesCache.get(competitionId);
+    const now = Date.now();
+    const TTL = 10 * 60 * 1000; // 10 minute
+
+    if (cached && now - cached.timestamp < TTL) {
+      return res.json(cached.matches);
+    }
+
     const today = new Date();
     const dateFrom = today.toISOString().slice(0, 10);
 
@@ -289,8 +352,10 @@ app.get("/api/matches", async (req, res) => {
 
     const data = await response.json();
 
+    const strengths = await getTeamStrengths(competitionId);
+
     const matches = (data.matches || []).map((m) => {
-      const prediction = generatePrediction(m);
+      const prediction = generatePrediction(m, strengths);
 
       return {
         id: m.id,
@@ -301,6 +366,8 @@ app.get("/api/matches", async (req, res) => {
         prediction,
       };
     });
+
+    matchesCache.set(competitionId, { timestamp: now, matches });
 
     res.json(matches);
   } catch (err) {
