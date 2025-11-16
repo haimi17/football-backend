@@ -10,7 +10,7 @@ const API_BASE = "https://api.football-data.org/v4";
 app.use(cors());
 app.use(express.json());
 
-// Echipe considerate puternice
+// Echipe puternice
 const BIG_TEAMS = [
   "Real Madrid",
   "FC Barcelona",
@@ -29,10 +29,23 @@ const BIG_TEAMS = [
   "SSC Napoli",
 ];
 
+// Profil per ligă (medii aproximative)
+const LEAGUE_PROFILE = {
+  CL:  { goalsAvg: 2.9, pace: 1.10, cornersAvg: 10.0, cardsAvg: 4.1, foulsAvg: 23, shotsAvg: 25 },
+  PL:  { goalsAvg: 2.9, pace: 1.12, cornersAvg: 10.3, cardsAvg: 3.8, foulsAvg: 21, shotsAvg: 26 },
+  PD:  { goalsAvg: 2.5, pace: 0.98, cornersAvg: 9.2,  cardsAvg: 5.0, foulsAvg: 26, shotsAvg: 22 },
+  SA:  { goalsAvg: 2.4, pace: 0.92, cornersAvg: 9.0,  cardsAvg: 5.3, foulsAvg: 27, shotsAvg: 21 },
+  BL1: { goalsAvg: 3.1, pace: 1.18, cornersAvg: 10.0, cardsAvg: 4.0, foulsAvg: 22, shotsAvg: 25 },
+  FL1: { goalsAvg: 2.6, pace: 0.96, cornersAvg: 9.5,  cardsAvg: 4.0, foulsAvg: 24, shotsAvg: 23 },
+  DED: { goalsAvg: 3.0, pace: 1.08, cornersAvg: 10.0, cardsAvg: 3.2, foulsAvg: 21, shotsAvg: 24 },
+  PPL: { goalsAvg: 2.4, pace: 0.90, cornersAvg: 8.9,  cardsAvg: 5.5, foulsAvg: 27, shotsAvg: 20 },
+  DEFAULT: { goalsAvg: 2.6, pace: 1.00, cornersAvg: 9.5, cardsAvg: 4.2, foulsAvg: 24, shotsAvg: 23 },
+};
+
 // Cache simplu în memorie
-const standingsCache = new Map(); // key: competitionId -> { timestamp, strengths }
-const matchesCache = new Map();   // key: competitionId -> { timestamp, matches }
-const formCache = new Map();      // key: competitionId -> { timestamp, formStats }
+const standingsCache = new Map(); // compId -> { timestamp, strengths }
+const matchesCache = new Map();   // compId -> { timestamp, matches }
+const formCache = new Map();      // compId -> { timestamp, formStats }
 
 app.get("/", (req, res) => {
   res.send("Football backend OK");
@@ -55,8 +68,26 @@ function prngForMatch(match, key) {
   const homeName = match?.homeTeam?.name || "";
   const awayName = match?.awayTeam?.name || "";
   const id = match?.id || 0;
-  const seed = `${id}-${homeName}-${awayName}-${key}`;
+  const compCode = match?.competition?.code || "";
+  const seed = `${id}-${homeName}-${awayName}-${compCode}-${key}`;
   return pseudoRandom(seed);
+}
+
+// Poisson simplu
+function poissonProb(lambda, k) {
+  if (lambda <= 0) return k === 0 ? 1 : 0;
+  const lnP = -lambda + k * Math.log(lambda) - logFactorial(k);
+  return Math.exp(lnP);
+}
+
+const factCache = {};
+function logFactorial(n) {
+  if (n <= 1) return 0;
+  if (factCache[n]) return factCache[n];
+  let s = 0;
+  for (let i = 2; i <= n; i++) s += Math.log(i);
+  factCache[n] = s;
+  return s;
 }
 
 // standings -> strength per team
@@ -69,9 +100,7 @@ async function getTeamStrengths(competitionId) {
     return cached.strengths;
   }
 
-  if (!API_KEY) {
-    return {};
-  }
+  if (!API_KEY) return {};
 
   try {
     const url = `${API_BASE}/competitions/${competitionId}/standings`;
@@ -94,9 +123,7 @@ async function getTeamStrengths(competitionId) {
     table.forEach((row, index) => {
       const teamName = row.team?.name;
       if (!teamName) return;
-
       const position = row.position ?? index + 1;
-
       const factor =
         1.15 - ((position - 1) / Math.max(n - 1, 1)) * 0.3; // 1.15 -> 0.85
       strengths[teamName] = factor;
@@ -114,8 +141,8 @@ async function getTeamStrengths(competitionId) {
   }
 }
 
-// formă recentă: ultimele ~60 zile, acasă / deplasare
-async function getTeamForm(competitionId) {
+// formă recentă + Elo, pe ultimele 45 zile
+async function getTeamFormAndElo(competitionId) {
   const cached = formCache.get(competitionId);
   const now = Date.now();
   const TTL = 6 * 60 * 60 * 1000;
@@ -124,16 +151,14 @@ async function getTeamForm(competitionId) {
     return cached.formStats;
   }
 
-  if (!API_KEY) {
-    return {};
-  }
+  if (!API_KEY) return {};
 
   try {
     const today = new Date();
     const to = new Date(today);
     to.setDate(today.getDate() - 1);
     const from = new Date(today);
-    from.setDate(today.getDate() - 60);
+    from.setDate(today.getDate() - 45);
 
     const dateFrom = from.toISOString().slice(0, 10);
     const dateTo = to.toISOString().slice(0, 10);
@@ -150,11 +175,21 @@ async function getTeamForm(competitionId) {
     }
 
     const data = await response.json();
-    const matches = data.matches || [];
+    const allMatches = (data.matches || []).filter(
+      (m) => m.status === "FINISHED"
+    );
+
+    // sortăm cronologic pentru Elo
+    allMatches.sort((a, b) => {
+      const da = a.utcDate || "";
+      const db = b.utcDate || "";
+      return da.localeCompare(db);
+    });
 
     const stats = {};
+    const elo = {};
 
-    function ensureTeam(name) {
+    function ensureTeamStats(name) {
       if (!stats[name]) {
         stats[name] = {
           home: { played: 0, points: 0, gf: 0, ga: 0 },
@@ -164,9 +199,13 @@ async function getTeamForm(competitionId) {
       return stats[name];
     }
 
-    for (const m of matches) {
-      if (m.status !== "FINISHED") continue;
+    function ensureElo(name) {
+      if (!elo[name]) elo[name] = 1500;
+      return elo[name];
+    }
 
+    // parcurgem meciurile o singură dată: formă + Elo
+    for (const m of allMatches) {
       const homeName = m.homeTeam?.name;
       const awayName = m.awayTeam?.name;
       if (!homeName || !awayName) continue;
@@ -176,8 +215,9 @@ async function getTeamForm(competitionId) {
       const ga = typeof ft.away === "number" ? ft.away : null;
       if (gh === null || ga === null) continue;
 
-      const homeStats = ensureTeam(homeName).home;
-      const awayStats = ensureTeam(awayName).away;
+      // formă
+      const homeStats = ensureTeamStats(homeName).home;
+      const awayStats = ensureTeamStats(awayName).away;
 
       homeStats.played += 1;
       homeStats.gf += gh;
@@ -195,10 +235,33 @@ async function getTeamForm(competitionId) {
         homeStats.points += 1;
         awayStats.points += 1;
       }
+
+      // Elo
+      let eloHome = ensureElo(homeName);
+      let eloAway = ensureElo(awayName);
+
+      const expHome = 1 / (1 + Math.pow(10, (eloAway - eloHome) / 400));
+      const expAway = 1 - expHome;
+
+      let resHome = 0.5;
+      let resAway = 0.5;
+      if (gh > ga) {
+        resHome = 1;
+        resAway = 0;
+      } else if (gh < ga) {
+        resHome = 0;
+        resAway = 1;
+      }
+
+      const K = 18;
+      eloHome = eloHome + K * (resHome - expHome);
+      eloAway = eloAway + K * (resAway - expAway);
+
+      elo[homeName] = eloHome;
+      elo[awayName] = eloAway;
     }
 
     const formStats = {};
-
     Object.entries(stats).forEach(([team, v]) => {
       const home = v.home;
       const away = v.away;
@@ -229,6 +292,7 @@ async function getTeamForm(competitionId) {
         homeGa,
         awayGa,
         overallGa,
+        elo: elo[team] || 1500,
       };
     });
 
@@ -236,14 +300,66 @@ async function getTeamForm(competitionId) {
 
     return formStats;
   } catch (err) {
-    console.error("Eroare server getTeamForm:", err);
+    console.error("Eroare server getTeamFormAndElo:", err);
     return {};
   }
+}
+
+// calcul scor corect și xG cu Poisson
+function computeXgAndScoreProb(
+  xgHome,
+  xgAway,
+  maxGoals = 4
+) {
+  const scores = [];
+  let pTotal = 0;
+
+  for (let gh = 0; gh <= maxGoals; gh++) {
+    for (let ga = 0; ga <= maxGoals; ga++) {
+      const pH = poissonProb(xgHome, gh);
+      const pA = poissonProb(xgAway, ga);
+      const p = pH * pA;
+      scores.push({ gh, ga, p });
+      pTotal += p;
+    }
+  }
+
+  // normalizăm dacă e nevoie
+  if (pTotal > 0) {
+    scores.forEach((s) => {
+      s.p = s.p / pTotal;
+    });
+  }
+
+  scores.sort((a, b) => b.p - a.p);
+  const top3 = scores.slice(0, 3).map((s) => ({
+    score: `${s.gh}-${s.ga}`,
+    prob: Math.round(s.p * 100),
+  }));
+
+  // probabilități agregate pentru goluri și BTTS
+  let pOver25 = 0;
+  let pBTTS = 0;
+  for (const s of scores) {
+    const totalGoals = s.gh + s.ga;
+    if (totalGoals >= 3) pOver25 += s.p;
+    if (s.gh > 0 && s.ga > 0) pBTTS += s.p;
+  }
+
+  return {
+    xgHome,
+    xgAway,
+    over25Prob: clamp(Math.round(pOver25 * 100), 0, 100),
+    bttsProb: clamp(Math.round(pBTTS * 100), 0, 100),
+    correctScoreTop3: top3,
+  };
 }
 
 function generatePrediction(match, strengths = {}, formStats = {}) {
   const homeName = match?.homeTeam?.name || "";
   const awayName = match?.awayTeam?.name || "";
+  const leagueCode = match?.competition?.code || "DEFAULT";
+  const leagueProfile = LEAGUE_PROFILE[leagueCode] || LEAGUE_PROFILE.DEFAULT;
 
   const tableStrengthHome = strengths[homeName] ?? 1;
   const tableStrengthAway = strengths[awayName] ?? 1;
@@ -267,25 +383,37 @@ function generatePrediction(match, strengths = {}, formStats = {}) {
   strengthHome *= homeFormFactor;
   strengthAway *= awayFormFactor;
 
-  const homeAdvantage = 0.15;
+  // Elo
+  const eloHome = formHome.elo ?? 1500;
+  const eloAway = formAway.elo ?? 1500;
+  const eloDiff = (eloHome - eloAway) / 400;
+
+  const eloFactorHome = clamp(1 + eloDiff * 0.25, 0.75, 1.3);
+  const eloFactorAway = clamp(1 - eloDiff * 0.25, 0.75, 1.3);
+
+  strengthHome *= eloFactorHome;
+  strengthAway *= eloFactorAway;
+
+  // avantaj teren
+  const homeAdvantage = 0.15 * leagueProfile.pace;
   strengthHome += homeAdvantage;
 
-  if (BIG_TEAMS.includes(homeName)) strengthHome += 0.25;
-  if (BIG_TEAMS.includes(awayName)) strengthAway += 0.25;
+  if (BIG_TEAMS.includes(homeName)) strengthHome += 0.22;
+  if (BIG_TEAMS.includes(awayName)) strengthAway += 0.22;
 
   const strengthDiff = Math.abs(strengthHome - strengthAway);
   const closeness = clamp(1 - strengthDiff, 0, 1);
 
   const baseDrawProb = 0.18 + 0.18 * closeness;
   const nonDrawProb = 1 - baseDrawProb;
-  const sumStrength = strengthHome + strengthAway;
+  const sumStrength = strengthHome + strengthAway || 1;
 
   let rawHome = (strengthHome / sumStrength) * nonDrawProb;
   let rawAway = (strengthAway / sumStrength) * nonDrawProb;
   let rawDraw = baseDrawProb;
 
-  const noiseHome = (prngForMatch(match, "home") - 0.5) * 0.06;
-  const noiseAway = (prngForMatch(match, "away") - 0.5) * 0.06;
+  const noiseHome = (prngForMatch(match, "home") - 0.5) * 0.05;
+  const noiseAway = (prngForMatch(match, "away") - 0.5) * 0.05;
   const noiseDraw = (prngForMatch(match, "draw") - 0.5) * 0.04;
 
   rawHome += noiseHome;
@@ -333,65 +461,119 @@ function generatePrediction(match, strengths = {}, formStats = {}) {
   confidence = clamp(Math.round(confidence), 50, 95);
 
   const overallGfHome =
-    formHome.overallGf ?? formHome.homeGf ?? 1.2;
+    formHome.overallGf ?? formHome.homeGf ?? leagueProfile.goalsAvg / 2;
   const overallGfAway =
-    formAway.overallGf ?? formAway.awayGf ?? 1.2;
+    formAway.overallGf ?? formAway.awayGf ?? leagueProfile.goalsAvg / 2;
+  const overallGaHome =
+    formHome.overallGa ?? formHome.homeGa ?? leagueProfile.goalsAvg / 2;
+  const overallGaAway =
+    formAway.overallGa ?? formAway.awayGa ?? leagueProfile.goalsAvg / 2;
+
+  const baseLeagueGoals = leagueProfile.goalsAvg;
+
+  let xgHome =
+    baseLeagueGoals *
+    0.55 *
+    (overallGfHome + 0.5) /
+    (overallGfHome + overallGfAway + 1);
+  let xgAway =
+    baseLeagueGoals *
+    0.45 *
+    (overallGfAway + 0.5) /
+    (overallGfHome + overallGfAway + 1);
+
+  const eloScale = clamp(1 + eloDiff * 0.20, 0.7, 1.3);
+  if (eloScale > 1) {
+    xgHome *= eloScale;
+  } else {
+    xgAway /= eloScale;
+  }
+
+  xgHome = clamp(xgHome, 0.3, 3.0);
+  xgAway = clamp(xgAway, 0.2, 2.8);
+
+  const paceFactor = leagueProfile.pace;
+  xgHome *= paceFactor;
+  xgAway *= paceFactor;
+
+  const xgResult = computeXgAndScoreProb(xgHome, xgAway, 4);
 
   const attackIndexBase = (probHome + probAway) / 200;
   const attackGoalsFactor = clamp(
-    (overallGfHome + overallGfAway) / 4,
+    (overallGfHome + overallGfAway) / (2 * (baseLeagueGoals / 2)),
     0.6,
     1.4
   );
   const attackIndex = clamp(
-    attackIndexBase * attackGoalsFactor,
+    attackIndexBase * attackGoalsFactor * paceFactor,
     0,
     1
   );
 
-  const goalsBase = 0.45 + attackIndex * 0.35;
-  const goalsNoise = (prngForMatch(match, "goals") - 0.5) * 0.15;
-  let goalsOver25 = clamp(goalsBase + goalsNoise, 0.25, 0.88);
-  let goalsUnder25 = 1 - goalsOver25;
+  const goalsOver25 = xgResult.over25Prob;
+  const goalsUnder25 = 100 - goalsOver25;
+  const bttsYes = xgResult.bttsProb;
+  const bttsNo = 100 - bttsYes;
 
-  let bttsBase = 0.40 + attackIndex * 0.30;
-  const bttsNoise = (prngForMatch(match, "btts") - 0.5) * 0.15;
-  let bttsYes = clamp(bttsBase + bttsNoise, 0.20, 0.85);
-  let bttsNo = 1 - bttsYes;
-
-  let cornersBase = 0.45 + attackIndex * 0.30;
+  const leagueCorners = leagueProfile.cornersAvg;
+  let cornersBase = leagueCorners / 11;
+  cornersBase *= 0.9 + attackIndex * 0.4;
   const cornersNoise = (prngForMatch(match, "corners") - 0.5) * 0.12;
-  let cornersOver = clamp(cornersBase + cornersNoise, 0.25, 0.90);
+  let cornersOver = clamp(
+    (cornersBase + cornersNoise) * 10,
+    0.25,
+    0.9
+  );
   let cornersUnder = 1 - cornersOver;
 
-  const overallGaHome =
-    formHome.overallGa ?? formHome.homeGa ?? 1.2;
-  const overallGaAway =
-    formAway.overallGa ?? formAway.awayGa ?? 1.2;
+  const leagueCards = leagueProfile.cardsAvg;
+  const leagueFouls = leagueProfile.foulsAvg;
   const defenseRoughness = clamp(
-    (overallGaHome + overallGaAway) / 4,
+    (overallGaHome + overallGaAway) / (2 * (baseLeagueGoals / 2)),
     0.6,
-    1.4
+    1.5
   );
 
-  let cardsBase = 0.45 + (1 - closeness) * 0.12;
-  cardsBase *= defenseRoughness;
+  let cardsBase =
+    (leagueCards / 10) * (0.9 + (1 - closeness) * 0.3) * defenseRoughness;
   const cardsNoise = (prngForMatch(match, "cards") - 0.5) * 0.18;
   let cardsOver = clamp(cardsBase + cardsNoise, 0.20, 0.90);
   let cardsUnder = 1 - cardsOver;
 
   let foulsHomeMore =
-    0.50 +
-    (prngForMatch(match, "fouls-home") - 0.5) * 0.20 +
+    0.5 +
+    (prngForMatch(match, "fouls-home") - 0.5) * 0.2 +
     (strengthHome - strengthAway) * 0.05;
-  foulsHomeMore = clamp(foulsHomeMore, 0.30, 0.70);
+  foulsHomeMore = clamp(foulsHomeMore, 0.3, 0.7);
   let foulsAwayMore = 1 - foulsHomeMore;
 
-  let shotsBase = 0.48 + attackIndex * 0.35;
-  shotsBase *= attackGoalsFactor;
+  let shotsBase =
+    (leagueProfile.shotsAvg / 25) *
+    (0.85 + attackIndex * 0.6) *
+    attackGoalsFactor;
   const shotsNoise = (prngForMatch(match, "shots") - 0.5) * 0.15;
-  let shotsOver = clamp(shotsBase + shotsNoise, 0.30, 0.92);
+  let shotsOver = clamp(shotsBase + shotsNoise, 0.3, 0.92);
   let shotsUnder = 1 - shotsOver;
+
+  const xgTotal = xgResult.xgHome + xgResult.xgAway;
+  let intensity =
+    0.4 * attackIndex +
+    0.25 * (leagueProfile.pace - 0.8) / 0.5 +
+    0.2 * (xgTotal / 3.0) +
+    0.15 * ((leagueCorners - 8) / 4);
+  intensity = clamp(Math.round(intensity * 100), 10, 95);
+
+  let riskScore = 0;
+  riskScore += (1 - margin) * 0.5;
+  riskScore += closeness * 0.3;
+  const formVolatility =
+    Math.abs(homePpm - ppmMid) + Math.abs(awayPpm - ppmMid);
+  riskScore += clamp(formVolatility / 3, 0, 0.2);
+  riskScore = clamp(riskScore, 0, 1);
+  const riskLevelNum = Math.round(riskScore * 100);
+  let riskLabel = "scăzut";
+  if (riskLevelNum >= 66) riskLabel = "ridicat";
+  else if (riskLevelNum >= 33) riskLabel = "mediu";
 
   return {
     probHome,
@@ -401,10 +583,10 @@ function generatePrediction(match, strengths = {}, formStats = {}) {
     confidence,
 
     goals: {
-      over25: Math.round(goalsOver25 * 100),
-      under25: Math.round(goalsUnder25 * 100),
-      bttsYes: Math.round(bttsYes * 100),
-      bttsNo: Math.round(bttsNo * 100),
+      over25: goalsOver25,
+      under25: goalsUnder25,
+      bttsYes,
+      bttsNo,
     },
 
     corners: {
@@ -426,9 +608,27 @@ function generatePrediction(match, strengths = {}, formStats = {}) {
       totalOver: Math.round(shotsOver * 100),
       totalUnder: Math.round(shotsUnder * 100),
     },
+
+    xg: {
+      home: Number(xgResult.xgHome.toFixed(2)),
+      away: Number(xgResult.xgAway.toFixed(2)),
+      total: Number((xgResult.xgHome + xgResult.xgAway).toFixed(2)),
+    },
+
+    correctScore: {
+      top3: xgResult.correctScoreTop3,
+    },
+
+    meta: {
+      intensity,
+      riskLevel: riskLevelNum,
+      riskLabel,
+      leagueCode,
+    },
   };
 }
 
+// competiții
 app.get("/api/competitions", async (req, res) => {
   try {
     if (!API_KEY) {
@@ -466,6 +666,7 @@ app.get("/api/competitions", async (req, res) => {
   }
 });
 
+// meciuri + predicții
 app.get("/api/matches", async (req, res) => {
   try {
     const competitionId = req.query.competitionId;
@@ -516,7 +717,7 @@ app.get("/api/matches", async (req, res) => {
     const data = await response.json();
 
     const strengths = await getTeamStrengths(competitionId);
-    const formStats = await getTeamForm(competitionId);
+    const formStats = await getTeamFormAndElo(competitionId);
 
     const matches = (data.matches || []).map((m) => {
       const prediction = generatePrediction(m, strengths, formStats);
