@@ -15,24 +15,30 @@ app.get("/", (req, res) => {
   res.send("Football backend OK");
 });
 
-// Helper: generează o predicție simplă pentru un meci
+// Helper: generează o pereche (A,B) care să dea 100%
+function generatePair(minHigh = 55, maxHigh = 80) {
+  const high = Math.round(minHigh + Math.random() * (maxHigh - minHigh));
+  const low = 100 - high;
+  return [high, low];
+}
+
+// Helper: generează o predicție mai bogată pentru un meci
 function generatePrediction() {
-  // valori brute, apoi normalizăm la 100%
-  const rawHome = 0.4 + Math.random() * 0.3; // 0.40 - 0.70
-  const rawDraw = 0.1 + Math.random() * 0.2; // 0.10 - 0.30
-  const rawAway = 0.2 + Math.random() * 0.3; // 0.20 - 0.50
+  // 1) 1X2 – victorie gazde / egal / victorie oaspeți
+  const rawHome = 0.4 + Math.random() * 0.4; // 0.40 - 0.80
+  const rawDraw = 0.1 + Math.random() * 0.25; // 0.10 - 0.35
+  const rawAway = 0.2 + Math.random() * 0.4; // 0.20 - 0.60
 
-  const total = rawHome + rawDraw + rawAway;
+  const totalMain = rawHome + rawDraw + rawAway;
 
-  let probHome = Math.round((rawHome / total) * 100);
-  let probDraw = Math.round((rawDraw / total) * 100);
-  let probAway = Math.round((rawAway / total) * 100);
+  let probHome = Math.round((rawHome / totalMain) * 100);
+  let probDraw = Math.round((rawDraw / totalMain) * 100);
+  let probAway = Math.round((rawAway / totalMain) * 100);
 
   // ajustare mică să fie exact 100%
-  const sum = probHome + probDraw + probAway;
+  let sum = probHome + probDraw + probAway;
   if (sum !== 100) {
     const diff = 100 - sum;
-    // corectăm cea mai mare probabilitate
     if (probHome >= probDraw && probHome >= probAway) {
       probHome += diff;
     } else if (probAway >= probHome && probAway >= probDraw) {
@@ -42,21 +48,63 @@ function generatePrediction() {
     }
   }
 
-  const arr = [probHome, probDraw, probAway];
-  const maxProb = Math.max(...arr);
+  const mainArr = [probHome, probDraw, probAway];
+  const maxProb = Math.max(...mainArr);
 
   let mainPick = "HOME";
   if (maxProb === probDraw) mainPick = "DRAW";
   if (maxProb === probAway) mainPick = "AWAY";
 
-  const confidence = maxProb; // folosim valoarea maximă ca "încredere"
+  // „încredere” – legată de cea mai mare probabilitate, dar puțin împinsă în sus
+  let confidence = maxProb + 15; // de ex. 65% -> 80%
+  if (confidence > 95) confidence = 95;
+
+  // 2) Goluri (over/under 2.5) și BTTS
+  const [over25, under25] = generatePair(52, 80);
+  const [bttsYes, bttsNo] = generatePair(50, 78);
+
+  // 3) Cornere (over/under 9.5)
+  const [cornersOver, cornersUnder] = generatePair(50, 78);
+
+  // 4) Cartonașe (over/under 4.5)
+  const [cardsOver, cardsUnder] = generatePair(50, 78);
+
+  // 5) Faulturi – care echipă e mai „tare” la faulturi (procente)
+  const [foulsHome, foulsAway] = generatePair(50, 75);
 
   return {
-    probHome,    // procent 0-100
-    probDraw,    // procent 0-100
-    probAway,    // procent 0-100
-    mainPick,    // "HOME" | "DRAW" | "AWAY"
-    confidence,  // 0-100, ne va ajuta la filtrul de 80%
+    // 1X2
+    probHome,
+    probDraw,
+    probAway,
+    mainPick, // "HOME" | "DRAW" | "AWAY"
+    confidence, // 0-100, o folosim la filtru ≥80%
+
+    // Goluri
+    goals: {
+      over25,
+      under25,
+      bttsYes,
+      bttsNo,
+    },
+
+    // Cornere
+    corners: {
+      over9_5: cornersOver,
+      under9_5: cornersUnder,
+    },
+
+    // Cartonașe
+    cards: {
+      over4_5: cardsOver,
+      under4_5: cardsUnder,
+    },
+
+    // Faulturi
+    fouls: {
+      homeMore: foulsHome,
+      awayMore: foulsAway,
+    },
   };
 }
 
@@ -78,7 +126,10 @@ app.get("/api/competitions", async (req, res) => {
       console.error("Eroare la /competitions:", response.status, text);
       return res
         .status(response.status)
-        .json({ error: "Eroare de la football-data.org", status: response.status });
+        .json({
+          error: "Eroare de la football-data.org",
+          status: response.status,
+        });
     }
 
     const data = await response.json();
@@ -100,7 +151,9 @@ app.get("/api/matches", async (req, res) => {
   try {
     const competitionId = req.query.competitionId;
     if (!competitionId) {
-      return res.status(400).json({ error: "Lipsește parametrul competitionId" });
+      return res
+        .status(400)
+        .json({ error: "Lipsește parametrul competitionId" });
     }
 
     if (!API_KEY) {
@@ -127,7 +180,10 @@ app.get("/api/matches", async (req, res) => {
       console.error("Eroare la /matches:", response.status, text);
       return res
         .status(response.status)
-        .json({ error: "Eroare de la football-data.org", status: response.status });
+        .json({
+          error: "Eroare de la football-data.org",
+          status: response.status,
+        });
     }
 
     const data = await response.json();
@@ -141,7 +197,7 @@ app.get("/api/matches", async (req, res) => {
         competition: m.competition?.name,
         homeTeam: m.homeTeam?.name,
         awayTeam: m.awayTeam?.name,
-        prediction, // NOU: probabilități simple
+        prediction,
       };
     });
 
