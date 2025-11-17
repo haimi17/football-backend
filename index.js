@@ -90,19 +90,47 @@ app.get("/", (req, res) => {
  * /api/competitions
  * Listă statică de ligi populare, cu ID-urile API-FOOTBALL
  */
-app.get("/api/competitions", (req, res) => {
-  const competitions = [
-    { id: 39, code: "ENG1", name: "Premier League (ENG)" },
-    { id: 140, code: "ESP1", name: "La Liga (ESP)" },
-    { id: 135, code: "ITA1", name: "Serie A (ITA)" },
-    { id: 78, code: "GER1", name: "Bundesliga (GER)" },
-    { id: 61, code: "FRA1", name: "Ligue 1 (FRA)" },
-    { id: 88, code: "NED1", name: "Eredivisie (NED)" },
-    { id: 94, code: "POR1", name: "Primeira Liga (POR)" },
-    { id: 2, code: "UCL", name: "UEFA Champions League" },
-  ];
+// =========================
+//    GET MATCHES (FIXTURES)
+// =========================
 
-  res.json(competitions);
+app.get("/api/matches", async (req, res) => {
+  try {
+    const competitionId = req.query.competitionId;
+    if (!competitionId) {
+      return res.status(400).json({ error: "competitionId lipsă" });
+    }
+
+    if (!API_KEY) {
+      return res.status(500).json({ error: "API_FOOTBALL_KEY lipsă în backend" });
+    }
+
+    const today = new Date().toISOString().split("T")[0];
+
+    const url = `${API_BASE}/fixtures?league=${competitionId}&season=2024&from=${today}&to=${today}`;
+
+    const response = await fetch(url, {
+      method: "GET",
+      headers: {
+        "x-apisports-key": API_KEY,
+        "x-rapidapi-host": "v3.football.api-sports.io"
+      }
+    });
+
+    const data = await response.json();
+
+    if (!data || !data.response) {
+      return res.status(500).json({ error: "Răspuns invalid de la API-Football" });
+    }
+
+    return res.json({
+      matches: data.response
+    });
+
+  } catch (err) {
+    console.error("Eroare /api/matches:", err);
+    return res.status(500).json({ error: "Eroare internă la meciuri" });
+  }
 });
 
 /**
