@@ -10,7 +10,7 @@ const API_BASE = "https://api.football-data.org/v4";
 app.use(cors());
 app.use(express.json());
 
-// ---------- CACHE SIMPLU ÎN MEMORIE ----------
+// ---------- CACHE SIMPLU ----------
 const CACHE_TTL_MS = 60 * 1000; // 60 secunde
 
 const competitionsCache = {
@@ -20,24 +20,21 @@ const competitionsCache = {
 
 const matchesCache = {}; // cheie: competitionId -> { timestamp, data }
 
-// ---------- HELPERI PENTRU RANDOM / HASH ----------
+// ---------- HELPERI RANDOM / HASH ----------
 
-// pseudo-random determinist dintr-un string (ca să avem valori diferite pe meci)
 function pseudoRandomFromString(str) {
   let h = 0;
   for (let i = 0; i < str.length; i++) {
     h = (h * 31 + str.charCodeAt(i)) % 1000000007;
   }
-  // 0 .. 1
-  return (h % 10000) / 10000;
+  return (h % 10000) / 10000; // 0..1
 }
 
-// rotunjire la procent
 function pct(x) {
   return Math.round(x * 100);
 }
 
-// ---------- MODEL DE PREDICȚIE BAZĂ (goluri, cornere, cartonașe) ----------
+// ---------- MODEL BAZĂ (goluri, BTTS, etc) ----------
 
 function generateBasePrediction(match) {
   const key = `${match.homeTeam?.name || ""}-${match.awayTeam?.name || ""}-${
@@ -48,9 +45,8 @@ function generateBasePrediction(match) {
   const r2 = pseudoRandomFromString(key + "d");
   const r3 = pseudoRandomFromString(key + "a");
 
-  // 1X2 brut
-  const rawHome = 0.35 + 0.25 * r1; // între 35% și 60%
-  const rawAway = 0.25 + 0.25 * r2; // între 25% și 50%
+  const rawHome = 0.35 + 0.25 * r1;
+  const rawAway = 0.25 + 0.25 * r2;
   let rawDraw = 1 - (rawHome + rawAway);
 
   if (rawDraw < 0.15) rawDraw = 0.15;
@@ -71,31 +67,25 @@ function generateBasePrediction(match) {
   if (maxProb === probDraw) mainPick = "DRAW";
   if (maxProb === probAway) mainPick = "AWAY";
 
-  // goluri (over/under 2.5) – folosim alt seed ca să NU fie la fel la toate meciurile
   const gSeed = pseudoRandomFromString(key + "goals");
-  const over25 = 45 + Math.round(gSeed * 35); // 45% – 80%
+  const over25 = 45 + Math.round(gSeed * 35);
   const under25 = 100 - over25;
 
-  // ambele marchează
   const bttsSeed = pseudoRandomFromString(key + "btts");
-  const bttsYes = 40 + Math.round(bttsSeed * 40); // 40% – 80%
+  const bttsYes = 40 + Math.round(bttsSeed * 40);
   const bttsNo = 100 - bttsYes;
 
-  // cornere peste/sub 9.5
   const cSeed = pseudoRandomFromString(key + "corners");
-  const cornersOver = 40 + Math.round(cSeed * 40); // 40–80
+  const cornersOver = 40 + Math.round(cSeed * 40);
   const cornersUnder = 100 - cornersOver;
 
-  // cartonașe peste/sub 4.5
   const cardsSeed = pseudoRandomFromString(key + "cards");
   const cardsOver = 40 + Math.round(cardsSeed * 40);
   const cardsUnder = 100 - cardsOver;
 
-  // xG simplificat
-  const xgHome = 0.9 + 1.4 * r1; // 0.9 – 2.3
-  const xgAway = 0.7 + 1.3 * r3; // 0.7 – 2.0
+  const xgHome = 0.9 + 1.4 * r1;
+  const xgAway = 0.7 + 1.3 * r3;
 
-  // „încredere” de bază – cât de mare e maxProb
   const confidence = maxProb;
 
   return {
@@ -128,7 +118,7 @@ function generateBasePrediction(match) {
   };
 }
 
-// ---------- „ELO” FOARTE SIMPLIFICAT (diferență de forță) ----------
+// ---------- MODEL ELO FOARTE SIMPLU ----------
 
 function computeEloPrediction(match) {
   const key = `${match.homeTeam?.name || ""}-${match.awayTeam?.name || ""}-${
@@ -136,8 +126,7 @@ function computeEloPrediction(match) {
   }`;
 
   const eloSeed = pseudoRandomFromString(key + "elo");
-  // -0.3 .. +0.3 – avantaj spre gazde (+) sau oaspeți (-)
-  const diff = eloSeed * 0.6 - 0.3;
+  const diff = eloSeed * 0.6 - 0.3; // -0.3..+0.3
 
   let baseHome = 0.45 + diff;
   let baseAway = 0.30 - diff;
@@ -172,13 +161,13 @@ function computeEloPrediction(match) {
   };
 }
 
-// ---------- ROOT SIMPLU ----------
+// ---------- ROOT ----------
 
 app.get("/", (req, res) => {
-  res.send("Football backend OK");
+  res.send("Football backend OK (with backtest)");
 });
 
-// ---------- 1. LISTA COMPETIȚII ----------
+// ---------- COMPETIȚII ----------
 
 app.get("/api/competitions", async (req, res) => {
   try {
@@ -225,7 +214,7 @@ app.get("/api/competitions", async (req, res) => {
   }
 });
 
-// ---------- 2. MECIURI + PREDCIȚII (cu cache + ELO) ----------
+// ---------- MECIURI LIVE (următoarele 7 zile) ----------
 
 app.get("/api/matches", async (req, res) => {
   try {
@@ -323,6 +312,20 @@ app.get("/api/matches", async (req, res) => {
   }
 });
 
-app.listen(PORT, () => {
-  console.log(`Backend running on port ${PORT}`);
-});
+// ---------- BACKTEST: MECIURI JUCATE ----------
+
+app.get("/api/backtest", async (req, res) => {
+  try {
+    const competitionId = req.query.competitionId;
+    let days = Number(req.query.days || 30);
+
+    if (!competitionId) {
+      return res
+        .status(400)
+        .json({ error: "Lipsește parametrul competitionId" });
+    }
+
+    if (!API_KEY) {
+      return res
+        .status(500)
+        .json({ error: "FOOTBALL_DATA_KEY lipsă în backend" });
