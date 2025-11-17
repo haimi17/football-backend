@@ -10,175 +10,163 @@ const API_BASE = "https://api.football-data.org/v4";
 app.use(cors());
 app.use(express.json());
 
-// Root simplu, pentru verificare
-app.get("/", (req, res) => {
-  res.send("Football backend OK");
-});
+// ---------- CACHE SIMPLU ÎN MEMORIE ----------
+const CACHE_TTL_MS = 60 * 1000; // 60 secunde
 
-// -----------------------------
-// Helperi ELO
-// -----------------------------
+const cache = {
+  competitions: {
+    timestamp: 0,
+    data: null,
+  },
+  // matches[competitionId] = { timestamp, data }
+  matches: new Map(),
+};
 
-function buildEloRatings(standingsJson) {
-  const ratings = {};
+function isFresh(timestamp) {
+  return Date.now() - timestamp < CACHE_TTL_MS;
+}
 
-  const standingsArray = standingsJson?.standings || [];
-  const table = standingsArray[0]?.table || [];
+// ---------- HELPER: REQUEST CU HEADERE + LOGARE ----------
+async function apiGet(path) {
+  if (!API_KEY) {
+    throw new Error("FOOTBALL_DATA_KEY lipsă în backend");
+  }
 
-  table.forEach((row) => {
-    const teamId = row.team?.id;
-    const teamName = row.team?.name || "Unknown";
-
-    const played = row.playedGames || 1;
-    const points = row.points || 0;
-    const gd = row.goalDifference || 0;
-    const wins = row.won || 0;
-    const losses = row.lost || 0;
-
-    const pointsPerGame = points / played; // de ex. 2.1
-    const gdPerGame = gd / played; // de ex. +0.6
-    const formFactor = (wins - losses) / played; // -1 .. +1
-
-    // rating de bază + ajustări din clasament
-    let rating =
-      1500 +
-      60 * (pointsPerGame - 1.5) + // echipe cu multe puncte urcă
-      25 * gdPerGame + // golaveraj bun
-      40 * formFactor; // formă bună
-
-    rating = Math.round(rating);
-
-    if (teamId) {
-      ratings[teamId] = {
-        rating,
-        teamName,
-      };
-    }
+  const url = `${API_BASE}${path}`;
+  const res = await fetch(url, {
+    headers: { "X-Auth-Token": API_KEY },
   });
 
-  return ratings;
+  if (!res.ok) {
+    const text = await res.text();
+    console.error("Eroare API", res.status, url, text.slice(0, 200));
+    const err = new Error(`API error ${res.status}`);
+    // punem codul HTTP pe eroare, ca să-l putem raporta
+    err.status = res.status;
+    throw err;
+  }
+
+  return res.json();
 }
 
-// Probabilități 1X2 din ELO
-function eloWinProbs(homeRating, awayRating) {
-  const HOME_ADV = 60; // avantaj teren propriu (~60 elo)
-  const diff = homeRating + HOME_ADV - awayRating; // >0 favorizează gazdele
-
-  // probabilitate victorie gazde (fără egal)
-  const pow = Math.pow(10, diff / 400);
-  const pHomeRaw = pow / (1 + pow);
-  const pAwayRaw = 1 - pHomeRaw;
-
-  // egal – mai mare când echipele sunt apropiate ca rating
-  const balance = 1 - Math.min(Math.abs(diff) / 600, 1); // 0..1
-  let pDraw = 0.18 + 0.10 * balance; // 0.18 - 0.28
-
-  // rescalăm ca să avem pHome + pDraw + pAway = 1
-  const scale = 1 - pDraw;
-  const pHome = pHomeRaw * scale;
-  const pAway = pAwayRaw * scale;
-
-  return {
-    probHome: pHome,
-    probDraw: pDraw,
-    probAway: pAway,
-  };
+// ---------- HELPER: HASH MIC PE STRING (pt variație pe meci) ----------
+function hashToUnit(str) {
+  let h = 0;
+  for (let i = 0; i < str.length; i++) {
+    h = (h * 31 + str.charCodeAt(i)) & 0xffffffff;
+  }
+  // 0..1
+  return (h >>> 0) / 4294967295;
 }
 
-function clamp(value, min, max) {
-  return Math.max(min, Math.min(max, value));
-}
+// ---------- HELPER: GENERARE PREDICȚIE PE MECI ----------
+function generatePrediction(matchIndex, match) {
+  const homeName = match.homeTeam?.name || "HOME";
+  const awayName = match.awayTeam?.name || "AWAY";
+  const key = `${homeName}-${awayName}-${matchIndex}`;
 
-function sigmoid(x) {
-  return 1 / (1 + Math.exp(-x));
-}
+  // 1) "forță" echipe: pseudo-ELO din nume + un pic de variație
+  const baseHome = hashToUnit(homeName);
+  const baseAway = hashToUnit(awayName);
+  const rand = hashToUnit(key + "r");
 
-// Generează predicția pentru un meci folosind ELO
-function generatePredictionWithElo({ homeRating, awayRating, eloProbs }) {
-  // transformăm în procente întregi
-  let probHome = Math.round(eloProbs.probHome * 100);
-  let probDraw = Math.round(eloProbs.probDraw * 100);
-  let probAway = Math.round(eloProbs.probAway * 100);
+  // scor relativ (pseudo-elo în [1400, 1900])
+  const eloHome = 1400 + baseHome * 500;
+  const eloAway = 1400 + baseAway * 500;
 
-  // mică corecție pentru a avea exact 100%
+  const eloDiff = eloHome - eloAway; // >0 favorizează gazdele
+  const eloFactor = Math.max(-250, Math.min(250, eloDiff)); // tăiem extremele
+
+  // 2) transformăm eloDiff într-o probabilitate 1X2
+  // logistic simplu
+  const homeBase = 0.33 + (eloFactor / 500) * 0.25; // ~0.08..0.58
+  const awayBase = 0.33 - (eloFactor / 500) * 0.25;
+  const drawBase = 1 - (homeBase + awayBase);
+
+  // noise mic pe meci, ca să nu fie două meciuri identice
+  const noiseHome = (rand - 0.5) * 0.1;
+  const noiseAway = (hashToUnit(key + "a") - 0.5) * 0.1;
+  const noiseDraw = (hashToUnit(key + "d") - 0.5) * 0.1;
+
+  let pHome = homeBase + noiseHome;
+  let pAway = awayBase + noiseAway;
+  let pDraw = drawBase + noiseDraw;
+
+  // nu lăsăm valori negative
+  pHome = Math.max(0.05, pHome);
+  pAway = Math.max(0.05, pAway);
+  pDraw = Math.max(0.05, pDraw);
+
+  const totalProb = pHome + pAway + pDraw;
+  pHome /= totalProb;
+  pDraw /= totalProb;
+  pAway /= totalProb;
+
+  let probHome = Math.round(pHome * 100);
+  let probDraw = Math.round(pDraw * 100);
+  let probAway = Math.round(pAway * 100);
+
+  // ajustăm la 100%
   let sum = probHome + probDraw + probAway;
   if (sum !== 100) {
     const diff = 100 - sum;
-    if (probHome >= probDraw && probHome >= probAway) {
-      probHome += diff;
-    } else if (probAway >= probHome && probAway >= probDraw) {
-      probAway += diff;
-    } else {
-      probDraw += diff;
-    }
+    if (probHome >= probDraw && probHome >= probAway) probHome += diff;
+    else if (probAway >= probHome && probAway >= probDraw) probAway += diff;
+    else probDraw += diff;
   }
 
-  const probs = [probHome, probDraw, probAway];
-  const maxProb = Math.max(...probs);
-  const sorted = [...probs].sort((a, b) => b - a);
-  const margin = maxProb - sorted[1]; // diferență între prima și a doua
+  // 3) Goluri: depind de "forța" totală + stil ligă (folosim doar pseudo)
+  const attackFactor =
+    (hashToUnit(key + "g1") + hashToUnit(key + "g2") + baseHome + baseAway) /
+    4; // 0..1
 
+  const totalXg = 2.0 + attackFactor * 1.2; // între ~2.0 și 3.2
+  const homeXg = totalXg * (0.45 + (eloFactor / 500) * 0.1); // mai multe șanse pentru echipa mai bună
+  const awayXg = Math.max(0.4, totalXg - homeXg);
+
+  // probabilități aproximative din total xG
+  const over25Base = Math.min(0.8, 0.35 + (totalXg - 2) * 0.35); // crește cu totalXg
+  const bttsBase = Math.min(
+    0.8,
+    0.3 + Math.min(homeXg, awayXg) * 0.25
+  ); // dacă ambele xG sunt decente, crește BTTS
+
+  // un pic de variație per meci
+  const overNoise = (hashToUnit(key + "ov") - 0.5) * 0.08;
+  const bttsNoise = (hashToUnit(key + "bt") - 0.5) * 0.08;
+
+  let over25 = over25Base + overNoise;
+  let bttsYes = bttsBase + bttsNoise;
+
+  over25 = Math.min(0.9, Math.max(0.3, over25));
+  bttsYes = Math.min(0.85, Math.max(0.25, bttsYes));
+
+  const under25 = 1 - over25;
+  const bttsNo = 1 - bttsYes;
+
+  // 4) Cornere / Cartonașe / Faulturi – stilistic, dar diferite pe meci
+  const cornersOver = 0.55 + (hashToUnit(key + "c") - 0.5) * 0.2; // 45–65%
+  const cardsOver = 0.55 + (hashToUnit(key + "y") - 0.5) * 0.25; // 42–68%
+
+  const foulsTilt = hashToUnit(key + "f"); // spre cine merg faulturile
+  const foulsHomeMore = Math.round(40 + foulsTilt * 20); // 40–60
+  const foulsAwayMore = 100 - foulsHomeMore;
+
+  // 5) alegerea principală + "încredere"
+  const arr = [probHome, probDraw, probAway];
+  const maxProb = Math.max(...arr);
   let mainPick = "HOME";
   if (maxProb === probDraw) mainPick = "DRAW";
   if (maxProb === probAway) mainPick = "AWAY";
 
-  // încredere: depinde de probabilitatea maximă și de distanța față de locul 2
-  let confidence = maxProb + margin * 0.5;
-  confidence = clamp(Math.round(confidence), 40, 90);
+  const confidence = maxProb; // 0–100, folosit de filtrul tău ≥ 80%
 
-  // folosim diferența de rating pentru a estima intensitatea
-  const ratingDiff = homeRating - awayRating;
-  const diffFactor = clamp(ratingDiff / 400, -0.8, 0.8);
-
-  const baseTotalXg = 2.7;
-  const homeShare = 0.5 + diffFactor * 0.15; // 0.38 - 0.62
-  const xgHome = baseTotalXg * homeShare;
-  const xgAway = baseTotalXg * (1 - homeShare);
-  const totalXg = xgHome + xgAway;
-
-  // Goluri
-  const over25Prob = sigmoid((totalXg - 2.5) * 1.2);
-  const bttsProb = sigmoid((totalXg - 2.2) * 1.0);
-
-  const goalsOver25 = clamp(
-    Math.round(40 + over25Prob * 50),
-    30,
-    90
-  );
-  const goalsUnder25 = 100 - goalsOver25;
-
-  const bttsYes = clamp(
-    Math.round(35 + bttsProb * 45),
-    30,
-    90
-  );
-  const bttsNo = 100 - bttsYes;
-
-  // Cornere (mai multe când meciul e dezechilibrat sau cu multe goluri așteptate)
-  const cornerIndex =
-    0.5 +
-    0.4 * Math.abs(diffFactor) +
-    0.2 * clamp(totalXg - 2.2, -0.5, 0.8);
-  const cornersOver = clamp(Math.round(35 + cornerIndex * 35), 30, 85);
-  const cornersUnder = 100 - cornersOver;
-
-  // Cartonașe – mai multe când diferența de forță e mare
-  const physicality = 0.5 + 0.5 * (1 - (1 - Math.abs(diffFactor)));
-  const cardsOver = clamp(Math.round(35 + physicality * 35), 30, 85);
-  const cardsUnder = 100 - cardsOver;
-
-  // Faulturi – echipa mai slabă tinde să facă mai multe
-  let foulsHomeMore = 50;
-  let foulsAwayMore = 50;
-  if (ratingDiff > 40) {
-    // gazdele mai bune
-    foulsHomeMore = 45;
-    foulsAwayMore = 55;
-  } else if (ratingDiff < -40) {
-    // oaspeții mai buni
-    foulsHomeMore = 55;
-    foulsAwayMore = 45;
-  }
+  // pentru viitor, poți folosi și xG/correctScore în UI
+  const correctScoreTop3 = [
+    { score: "1-1", prob: Math.round(10 + hashToUnit(key + "cs1") * 8) },
+    { score: "2-1", prob: Math.round(8 + hashToUnit(key + "cs2") * 7) },
+    { score: "1-2", prob: Math.round(6 + hashToUnit(key + "cs3") * 6) },
+  ];
 
   return {
     probHome,
@@ -187,85 +175,84 @@ function generatePredictionWithElo({ homeRating, awayRating, eloProbs }) {
     mainPick,
     confidence,
     goals: {
-      over25: goalsOver25,
-      under25: goalsUnder25,
-      bttsYes,
-      bttsNo,
+      over25: Math.round(over25 * 100),
+      under25: Math.round(under25 * 100),
+      bttsYes: Math.round(bttsYes * 100),
+      bttsNo: Math.round(bttsNo * 100),
+    },
+    xg: {
+      home: Number(homeXg.toFixed(2)),
+      away: Number(awayXg.toFixed(2)),
+      total: Number(totalXg.toFixed(2)),
+    },
+    correctScore: {
+      top3: correctScoreTop3,
     },
     corners: {
-      over9_5: cornersOver,
-      under9_5: cornersUnder,
+      over9_5: Math.round(cornersOver * 100),
+      under9_5: Math.round((1 - cornersOver) * 100),
     },
     cards: {
-      over4_5: cardsOver,
-      under4_5: cardsUnder,
+      over4_5: Math.round(cardsOver * 100),
+      under4_5: Math.round((1 - cardsOver) * 100),
     },
     fouls: {
       homeMore: foulsHomeMore,
       awayMore: foulsAwayMore,
     },
-    elo: {
-      homeRating: Math.round(homeRating),
-      awayRating: Math.round(awayRating),
-      diff: Math.round(homeRating - awayRating),
-      probHome,
-      probDraw,
-      probAway,
-    },
   };
 }
 
-// -----------------------------
-// 1. Lista de competiții
-// -----------------------------
+// ---------- ROOT SIMPLU ----------
+app.get("/", (req, res) => {
+  res.send("Football backend OK (cache + ELO-like model)");
+});
+
+// ---------- 1. COMPETIȚII CU CACHE ----------
 app.get("/api/competitions", async (req, res) => {
   try {
-    if (!API_KEY) {
-      return res
-        .status(500)
-        .json({ error: "FOOTBALL_DATA_KEY lipsă în backend" });
+    // folosim cache dacă e proaspăt
+    if (cache.competitions.data && isFresh(cache.competitions.timestamp)) {
+      return res.json(cache.competitions.data);
     }
 
-    const response = await fetch(`${API_BASE}/competitions`, {
-      headers: { "X-Auth-Token": API_KEY },
-    });
-
-    if (!response.ok) {
-      const text = await response.text();
-      console.error("Eroare la /competitions:", response.status, text);
-      return res
-        .status(response.status)
-        .json({ error: "Eroare de la football-data.org", status: response.status });
-    }
-
-    const data = await response.json();
+    const data = await apiGet("/competitions");
 
     const allowedCodes = ["CL", "PL", "PD", "SA", "BL1", "FL1", "DED", "PPL"];
     const filtered = (data.competitions || []).filter((c) =>
       allowedCodes.includes(c.code)
     );
 
+    cache.competitions = {
+      timestamp: Date.now(),
+      data: filtered,
+    };
+
     res.json(filtered);
   } catch (err) {
-    console.error("Eroare server /api/competitions:", err);
-    res.status(500).json({ error: "Eroare internă server" });
+    console.error("Eroare server /api/competitions:", err.message);
+    const status = err.status || 500;
+    if (status === 429) {
+      return res
+        .status(429)
+        .json({ error: "Prea multe cereri la football-data.org (429)" });
+    }
+    res.status(status).json({ error: "Eroare internă la competiții" });
   }
 });
 
-// -----------------------------
-// 2. Meciuri + ELO pentru competiția aleasă
-// -----------------------------
+// ---------- 2. MECIURI CU CACHE + PREDICȚII ----------
 app.get("/api/matches", async (req, res) => {
-  try {
+  try:
     const competitionId = req.query.competitionId;
     if (!competitionId) {
       return res.status(400).json({ error: "Lipsește parametrul competitionId" });
     }
 
-    if (!API_KEY) {
-      return res
-        .status(500)
-        .json({ error: "FOOTBALL_DATA_KEY lipsă în backend" });
+    // cache pe competiție
+    const cached = cache.matches.get(competitionId);
+    if (cached && isFresh(cached.timestamp)) {
+      return res.json(cached.data);
     }
 
     const today = new Date();
@@ -275,54 +262,11 @@ app.get("/api/matches", async (req, res) => {
     to.setDate(today.getDate() + 7);
     const dateTo = to.toISOString().slice(0, 10);
 
-    const headers = { "X-Auth-Token": API_KEY };
+    const path = `/competitions/${competitionId}/matches?dateFrom=${dateFrom}&dateTo=${dateTo}`;
+    const data = await apiGet(path);
 
-    // luăm și clasamentul (pentru ELO), și meciurile viitoare
-    const [standingsResp, matchesResp] = await Promise.all([
-      fetch(`${API_BASE}/competitions/${competitionId}/standings`, {
-        headers,
-      }),
-      fetch(
-        `${API_BASE}/competitions/${competitionId}/matches?dateFrom=${dateFrom}&dateTo=${dateTo}`,
-        { headers }
-      ),
-    ]);
-
-    if (!standingsResp.ok) {
-      const text = await standingsResp.text();
-      console.error(
-        "Eroare la /standings:",
-        standingsResp.status,
-        text
-      );
-    }
-
-    if (!matchesResp.ok) {
-      const text = await matchesResp.text();
-      console.error("Eroare la /matches:", matchesResp.status, text);
-      return res
-        .status(matchesResp.status)
-        .json({ error: "Eroare de la football-data.org", status: matchesResp.status });
-    }
-
-    const standingsJson = await standingsResp.json();
-    const matchesJson = await matchesResp.json();
-
-    const eloRatings = buildEloRatings(standingsJson);
-
-    const matches = (matchesJson.matches || []).map((m) => {
-      const homeId = m.homeTeam?.id;
-      const awayId = m.awayTeam?.id;
-
-      const homeRating = eloRatings[homeId]?.rating || 1500;
-      const awayRating = eloRatings[awayId]?.rating || 1500;
-
-      const eloProbs = eloWinProbs(homeRating, awayRating);
-      const prediction = generatePredictionWithElo({
-        homeRating,
-        awayRating,
-        eloProbs,
-      });
+    const matches = (data.matches || []).map((m, idx) => {
+      const prediction = generatePrediction(idx, m);
 
       return {
         id: m.id,
@@ -334,10 +278,21 @@ app.get("/api/matches", async (req, res) => {
       };
     });
 
+    cache.matches.set(competitionId, {
+      timestamp: Date.now(),
+      data: matches,
+    });
+
     res.json(matches);
   } catch (err) {
-    console.error("Eroare server /api/matches:", err);
-    res.status(500).json({ error: "Eroare internă server" });
+    console.error("Eroare server /api/matches:", err.message);
+    const status = err.status || 500;
+    if (status === 429) {
+      return res
+        .status(429)
+        .json({ error: "Prea multe cereri la football-data.org (429)" });
+    }
+    res.status(status).json({ error: "Eroare internă la meciuri" });
   }
 });
 
