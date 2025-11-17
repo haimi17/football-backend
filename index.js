@@ -5,32 +5,43 @@ import fetch from "node-fetch";
 const app = express();
 const PORT = process.env.PORT || 3000;
 
+// cheia din Render -> Environment -> API_FOOTBALL_KEY
 const API_KEY = process.env.API_FOOTBALL_KEY;
 const API_BASE = "https://v3.football.api-sports.io";
 
 app.use(cors());
 app.use(express.json());
 
-// ----------------------
-// Cache simplu (60 sec)
-// ----------------------
-const CACHE_TTL = 60 * 1000;
+// Cache simplu în memorie
+const CACHE_TTL_MS = 60 * 1000; // 60 secunde
 
 const cache = {
-  competitions: { data: null, timestamp: 0 },
-  matches: {} // cheie: competitionId
+  competitions: {
+    data: null,
+    timestamp: 0,
+  },
+  matches: {
+    // [leagueId]: { data, timestamp }
+  },
 };
 
-function isCacheValid(entry) {
-  return (
-    entry &&
-    entry.data &&
-    Date.now() - entry.timestamp < CACHE_TTL
-  );
+// Mic helper pentru data în format YYYY-MM-DD
+function formatDate(d) {
+  return d.toISOString().split("T")[0];
+}
+
+// Sezonul actual (stil Europa: sezon începe vara)
+function getCurrentSeason() {
+  const now = new Date();
+  const year = now.getUTCFullYear();
+  const month = now.getUTCMonth() + 1; // 1-12
+  // dacă suntem din iulie încolo, sezonul = anul curent
+  // altfel, sezonul = anul precedent (ex: martie 2026 -> sezon 2025)
+  return month >= 7 ? year : year - 1;
 }
 
 // ----------------------
-// Test cheie
+// 1. Test cheie
 // ----------------------
 app.get("/api/test-key", (req, res) => {
   if (!API_KEY) {
@@ -40,75 +51,85 @@ app.get("/api/test-key", (req, res) => {
 });
 
 // ----------------------
-// 1. Lista de competiții
+// 2. Listează competițiile (ligele)
+//     întoarcem un ARRAY simplu:
+//     [{ id, name, country }, ...]
 // ----------------------
 app.get("/api/competitions", async (req, res) => {
   try {
+    // cache valid
+    if (
+      cache.competitions.data &&
+      Date.now() - cache.competitions.timestamp < CACHE_TTL_MS
+    ) {
+      return res.json(cache.competitions.data);
+    }
+
     if (!API_KEY) {
       return res
         .status(500)
         .json({ error: "API_FOOTBALL_KEY lipsă în backend" });
     }
 
-    if (isCacheValid(cache.competitions)) {
-      return res.json(cache.competitions.data);
-    }
-
+    // ligile care sunt în sezon curent
     const url = `${API_BASE}/leagues?current=true`;
 
     const response = await fetch(url, {
       method: "GET",
       headers: {
-        "x-apisports-key": API_KEY
-      }
+        "x-apisports-key": API_KEY,
+      },
     });
 
     if (!response.ok) {
-      const text = await response.text();
-      console.error("Eroare la /leagues:", response.status, text);
+      const txt = await response.text();
+      console.error("Eroare /leagues:", response.status, txt);
       return res
-        .status(500)
-        .json({ error: "Eroare de la API-Football la /leagues" });
+        .status(response.status)
+        .json({ error: "Eroare la API-Football /leagues" });
     }
 
     const data = await response.json();
 
-    // Ligile principale (id-uri API-Football)
-    const wantedIds = [39, 140, 135, 78, 61, 88, 94];
+    if (!data || !Array.isArray(data.response)) {
+      console.error("Format neașteptat /leagues:", data);
+      return res
+        .status(500)
+        .json({ error: "Format neașteptat de la API-Football" });
+    }
 
-    const leagues = (data.response || [])
-      .filter((item) => wantedIds.includes(item.league?.id))
-      .map((item) => ({
-        id: item.league.id,
-        name: item.league.name,
-        code: item.country?.code || item.country?.name || ""
-      }));
+    // Simplificăm structura pentru frontend
+    const leagues = data.response.map((item) => ({
+      id: item.league.id,
+      name: item.league.name,
+      country: item.country?.name || "",
+    }));
 
+    // salvăm în cache ca ARRAY
     cache.competitions = {
       data: leagues,
-      timestamp: Date.now()
+      timestamp: Date.now(),
     };
 
     return res.json(leagues);
   } catch (err) {
-    console.error("Eroare /api/competitions:", err);
-    return res
-      .status(500)
-      .json({ error: "Eroare internă la competiții" });
+    console.error("Eroare server /api/competitions:", err);
+    return res.status(500).json({ error: "Eroare internă la competiții" });
   }
 });
 
 // ----------------------
-// 2. Meciuri (fixtures)
+// 3. Meciuri (fixtures) pentru o ligă
+//     GET /api/matches?competitionId=39
+//     răspuns:
+//     { matches: [ { id, utcDate, leagueName, homeTeam, awayTeam }, ... ] }
 // ----------------------
 app.get("/api/matches", async (req, res) => {
   try {
     const competitionId = req.query.competitionId;
 
     if (!competitionId) {
-      return res
-        .status(400)
-        .json({ error: "competitionId lipsă" });
+      return res.status(400).json({ error: "competitionId lipsă" });
     }
 
     if (!API_KEY) {
@@ -117,67 +138,76 @@ app.get("/api/matches", async (req, res) => {
         .json({ error: "API_FOOTBALL_KEY lipsă în backend" });
     }
 
+    const now = new Date();
+    const dateFrom = formatDate(now);
+
+    const to = new Date(now);
+    to.setDate(now.getDate() + 7); // următoarele 7 zile
+    const dateTo = formatDate(to);
+
+    const season = getCurrentSeason();
+
+    // cache per ligă
     const cached = cache.matches[competitionId];
-    if (isCacheValid(cached)) {
+    if (cached && Date.now() - cached.timestamp < CACHE_TTL_MS) {
       return res.json(cached.data);
     }
 
-    const today = new Date();
-    const from = today.toISOString().slice(0, 10);
-
-    const toDate = new Date(today);
-    toDate.setDate(today.getDate() + 7);
-    const to = toDate.toISOString().slice(0, 10);
-
-    // sezon 2024 – ajustează dacă e nevoie
     const url =
       `${API_BASE}/fixtures?league=${competitionId}` +
-      `&season=2024&from=${from}&to=${to}`;
+      `&season=${season}&from=${dateFrom}&to=${dateTo}&timezone=Europe/Bucharest`;
 
     const response = await fetch(url, {
       method: "GET",
       headers: {
-        "x-apisports-key": API_KEY
-      }
+        "x-apisports-key": API_KEY,
+      },
     });
 
     if (!response.ok) {
-      const text = await response.text();
-      console.error("Eroare la /fixtures:", response.status, text);
+      const txt = await response.text();
+      console.error("Eroare /fixtures:", response.status, txt);
       return res
-        .status(500)
-        .json({ error: "Eroare de la API-Football la /fixtures" });
+        .status(response.status)
+        .json({ error: "Eroare la API-Football /fixtures" });
     }
 
     const data = await response.json();
 
-    const matches = (data.response || []).map((item) => ({
-      id: item.fixture?.id,
-      utcDate: item.fixture?.date,
-      competition: item.league?.name,
-      homeTeam: item.teams?.home?.name,
-      awayTeam: item.teams?.away?.name
-      // aici, în pașii următori, vom adăuga statistici și predicții reale
+    if (!data || !Array.isArray(data.response)) {
+      console.error("Format neașteptat /fixtures:", data);
+      return res
+        .status(500)
+        .json({ error: "Format neașteptat de la API-Football" });
+    }
+
+    // Mapăm doar informațiile de bază de care ai nevoie în frontend
+    const matches = data.response.map((item) => ({
+      id: item.fixture.id,
+      utcDate: item.fixture.date,
+      leagueId: item.league.id,
+      leagueName: item.league.name,
+      homeTeam: item.teams.home.name,
+      awayTeam: item.teams.away.name,
     }));
 
-    const result = { matches };
+    const payload = { matches };
 
+    // punem în cache
     cache.matches[competitionId] = {
-      data: result,
-      timestamp: Date.now()
+      data: payload,
+      timestamp: Date.now(),
     };
 
-    return res.json(result);
+    return res.json(payload);
   } catch (err) {
-    console.error("Eroare /api/matches:", err);
-    return res
-      .status(500)
-      .json({ error: "Eroare internă la meciuri" });
+    console.error("Eroare server /api/matches:", err);
+    return res.status(500).json({ error: "Eroare internă la meciuri" });
   }
 });
 
 // ----------------------
-// Pornire server
+// Pornim serverul
 // ----------------------
 app.listen(PORT, () => {
   console.log(`Backend pornit pe port ${PORT}`);
