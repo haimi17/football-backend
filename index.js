@@ -243,7 +243,8 @@ app.get("/api/competitions", async (req, res) => {
 
 // ---------- 2. MECIURI CU CACHE + PREDICȚII ----------
 app.get("/api/matches", async (req, res) => {
-  try:
+  try {
+  try
     const competitionId = req.query.competitionId;
     if (!competitionId) {
       return res.status(400).json({ error: "Lipsește parametrul competitionId" });
