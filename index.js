@@ -5,18 +5,21 @@ import fetch from "node-fetch";
 const app = express();
 const PORT = process.env.PORT || 3000;
 
-// cheia de la API-FOOTBALL, din Render → Environment → API_SPORTS_KEY
-const API_KEY = process.env.API_SPORTS_KEY;
+// *** FOLOSEȘTE VARIABILA CORESPUNZĂTOARE DIN RENDER ***
+const API_KEY = process.env.API_FOOTBALL_KEY; 
 const API_BASE = "https://v3.football.api-sports.io";
 
-// CORS + JSON
+// Middleware
 app.use(cors());
 app.use(express.json());
 
-/**
- * Cache simplu în memorie, ca să nu depășim limita de request-uri
- * TTL: 2 minute pentru fixtures, 10 minute pentru standings
- */
+// TEST CHEIE API
+app.get("/api/test-key", (req, res) => {
+  if (!API_KEY) {
+    return res.status(500).json({ error: "API_FOOTBALL_KEY lipsă în backend" });
+  }
+  res.json({ message: "Cheie OK", keyExists: true });
+});
 const CACHE = {
   standings: {
     // [leagueId]: { timestamp, season, data }
