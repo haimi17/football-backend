@@ -221,20 +221,15 @@ app.get("/api/matches", async (req, res) => {
     const { from, to } = getFixtureWindow();
 
     // Fixtures viitoare
-    const fixturesData = await apiFetch("/fixtures", {
-      league: comp.apiLeagueId,
-      season: comp.season,
-      from,
-      to
-    });
+   const fixtures = await apiFetch("/fixtures", {
+  league: comp.apiLeagueId,
+  season: comp.season,
+  from: fromStr,
+  to: toStr
+});
 
-    const fixtures = fixturesData.response || [];
-
-    // Filtrăm meciuri programate / nu începute
-    const upcoming = fixtures.filter((fx) => {
-      const status = fx.fixture?.status?.short;
-      return status === "NS" || status === "TBD" || status === "PST";
-    });
+// nu mai filtrăm după status, lăsăm toate meciurile din intervalul de date
+const upcoming = fixtures;
 
     const matchesOut = [];
 
