@@ -1,4 +1,4 @@
-// index.js – backend Football Pro Analyzer (API-FOOTBALL PRO plan)
+// index.js – Football Pro Analyzer backend (API-FOOTBALL PRO)
 import express from "express";
 import cors from "cors";
 import fetch from "node-fetch";
@@ -13,29 +13,29 @@ app.use(cors());
 app.use(express.json());
 
 // ------------------------
-// Config competiții
+// Config competiții (fără sezon fix)
 // ------------------------
 const COMPETITIONS = [
   // Anglia
-  { id: 2021, code: "PL",  name: "Premier League",    country: "England",  apiLeagueId: 39,  season: 2024 },
+  { id: 2021, code: "PL",  name: "Premier League",    country: "England",  apiLeagueId: 39 },
   // Italia
-  { id: 2019, code: "SA",  name: "Serie A",           country: "Italy",    apiLeagueId: 135, season: 2024 },
+  { id: 2019, code: "SA",  name: "Serie A",           country: "Italy",    apiLeagueId: 135 },
   // Spania
-  { id: 2014, code: "PD",  name: "Primera División",  country: "Spain",    apiLeagueId: 140, season: 2024 },
+  { id: 2014, code: "PD",  name: "Primera División",  country: "Spain",    apiLeagueId: 140 },
   // Germania
-  { id: 2002, code: "BL1", name: "Bundesliga",        country: "Germany",  apiLeagueId: 78,  season: 2024 },
+  { id: 2002, code: "BL1", name: "Bundesliga",        country: "Germany",  apiLeagueId: 78 },
   // Franța
-  { id: 2015, code: "FL1", name: "Ligue 1",           country: "France",   apiLeagueId: 61,  season: 2024 },
+  { id: 2015, code: "FL1", name: "Ligue 1",           country: "France",   apiLeagueId: 61 },
   // Olanda
-  { id: 2003, code: "DED", name: "Eredivisie",        country: "Netherlands", apiLeagueId: 88, season: 2024 },
+  { id: 2003, code: "DED", name: "Eredivisie",        country: "Netherlands", apiLeagueId: 88 },
   // Portugalia
-  { id: 2017, code: "PPL", name: "Primeira Liga",     country: "Portugal", apiLeagueId: 94,  season: 2024 },
+  { id: 2017, code: "PPL", name: "Primeira Liga",     country: "Portugal", apiLeagueId: 94 },
   // Champions League
-  { id: 2001, code: "CL",  name: "UEFA Champions League", country: "Europe", apiLeagueId: 2, season: 2024 },
+  { id: 2001, code: "CL",  name: "UEFA Champions League", country: "Europe", apiLeagueId: 2 },
 
   // România – Superliga + Liga 2
-  { id: 2501, code: "RO1", name: "Superliga",         country: "Romania",  apiLeagueId: 283, season: 2024 },
-  { id: 2502, code: "RO2", name: "Liga 2",            country: "Romania",  apiLeagueId: 284, season: 2024 }
+  { id: 2501, code: "RO1", name: "Superliga",         country: "Romania",  apiLeagueId: 283 },
+  { id: 2502, code: "RO2", name: "Liga 2",            country: "Romania",  apiLeagueId: 284 }
 ];
 
 // cache simplu
@@ -101,6 +101,16 @@ function formScore(formStr) {
 
 function clamp(x, min, max) {
   return Math.max(min, Math.min(max, x));
+}
+
+// sezon dinamic tip Europa
+function getCurrentSeasonYear() {
+  const today = new Date();
+  const month = today.getMonth() + 1; // 1–12
+  if (month >= 7) {
+    return today.getFullYear();       // sezonul 2025 pentru 2025–2026
+  }
+  return today.getFullYear() - 1;     // înainte de iulie încă suntem în sezonul anterior
 }
 
 // ------------------------
@@ -190,8 +200,8 @@ function buildPoissonModel(lambdaHome, lambdaAway) {
 // ------------------------
 // Statistici echipă
 // ------------------------
-async function getTeamStats(teamId, comp) {
-  const key = `${comp.apiLeagueId}:${comp.season}:${teamId}`;
+async function getTeamStats(teamId, comp, seasonYear) {
+  const key = `${comp.apiLeagueId}:${seasonYear}:${teamId}`;
   const cached = cache.teamStats[key];
   if (cached && Date.now() - cached.timestamp < 10 * 60 * 1000) {
     return cached.data;
@@ -199,7 +209,7 @@ async function getTeamStats(teamId, comp) {
 
   const data = await apiFetch("/teams/statistics", {
     league: comp.apiLeagueId,
-    season: comp.season,
+    season: seasonYear,
     team: teamId
   });
 
@@ -261,20 +271,22 @@ app.get("/api/matches", async (req, res) => {
       return res.status(400).json({ error: "Competiție necunoscută" });
     }
 
+    const seasonYear = getCurrentSeasonYear();
+
     const cacheEntry = cache.matches[competitionId];
     if (cacheEntry && Date.now() - cacheEntry.timestamp < CACHE_TTL) {
       return res.json(cacheEntry.data);
     }
 
     const today = new Date();
-    const toDate = new Date(today.getTime() + 7 * 24 * 60 * 60 * 1000);
+    const toDate = new Date(today.getTime() + 10 * 24 * 60 * 60 * 1000);
 
     const fromStr = today.toISOString().split("T")[0];
     const toStr = toDate.toISOString().split("T")[0];
 
     const fixturesData = await apiFetch("/fixtures", {
       league: comp.apiLeagueId,
-      season: comp.season,
+      season: seasonYear,
       from: fromStr,
       to: toStr
     });
@@ -284,7 +296,7 @@ app.get("/api/matches", async (req, res) => {
     const nowTs = Math.floor(Date.now() / 1000);
     const upcoming = fixtures.filter((fx) => {
       const ts = fx.fixture?.timestamp;
-      return typeof ts === "number" && ts >= nowTs - 30 * 60; // nu mai vechi de 30 min
+      return typeof ts === "number" && ts >= nowTs - 30 * 60;
     });
 
     const matches = [];
@@ -299,8 +311,8 @@ app.get("/api/matches", async (req, res) => {
       const homeId = teams.home.id;
       const awayId = teams.away.id;
 
-      const homeStats = await getTeamStats(homeId, comp);
-      const awayStats = await getTeamStats(awayId, comp);
+      const homeStats = await getTeamStats(homeId, comp, seasonYear);
+      const awayStats = await getTeamStats(awayId, comp, seasonYear);
 
       let lambdaHome =
         0.6 * homeStats.avgGFHome + 0.4 * awayStats.avgGAAway;
