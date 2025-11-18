@@ -50,10 +50,6 @@ async function apiFetch(path, params = {}) {
 
   return data;
 }
-
-// ----------------------
-// Competiții urmărite
-// ----------------------
 // ----------------------
 // Competiții urmărite
 // ----------------------
