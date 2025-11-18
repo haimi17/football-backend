@@ -12,18 +12,16 @@ app.use(cors());
 app.use(express.json());
 
 // ----------------------
-// Fetch helper
+// Helper fetch API-FOOTBALL
 // ----------------------
 async function apiFetch(endpoint, params) {
-  const url =
-    API_BASE +
-    endpoint +
+  const qs =
     "?" +
     Object.entries(params)
       .map(([k, v]) => `${k}=${encodeURIComponent(v)}`)
       .join("&");
 
-  const res = await fetch(url, {
+  const res = await fetch(API_BASE + endpoint + qs, {
     headers: {
       "x-apisports-key": API_KEY,
       "x-rapidapi-host": "v3.football.api-sports.io"
@@ -35,24 +33,36 @@ async function apiFetch(endpoint, params) {
 }
 
 // ----------------------
-// Competitions — hardcoded
+// Sezon curent (tipic Europa: aug–mai)
+// ----------------------
+function getCurrentSeasonYear() {
+  const now = new Date();
+  const year = now.getFullYear();
+  const month = now.getMonth(); // 0 = ianuarie
+  return month >= 6 ? year : year - 1; // dacă e iulie sau mai târziu -> sezon anul acesta
+}
+
+const CURRENT_SEASON = getCurrentSeasonYear();
+
+// ----------------------
+// Competitions (leagueId + season dinamic)
 // ----------------------
 const COMPETITIONS = [
-  { id: 2021, code: "PL", name: "Premier League", country: "England", apiLeagueId: 39, season: 2024 },
-  { id: 2014, code: "PD", name: "La Liga", country: "Spain", apiLeagueId: 140, season: 2024 },
-  { id: 2002, code: "BL1", name: "Bundesliga", country: "Germany", apiLeagueId: 78, season: 2024 },
-  { id: 2019, code: "SA", name: "Serie A", country: "Italy", apiLeagueId: 135, season: 2024 },
-  { id: 2015, code: "FL1", name: "Ligue 1", country: "France", apiLeagueId: 61, season: 2024 },
-  { id: 2003, code: "DED", name: "Eredivisie", country: "Netherlands", apiLeagueId: 88, season: 2024 },
-  { id: 2017, code: "PPL", name: "Primeira Liga", country: "Portugal", apiLeagueId: 94, season: 2024 },
+  { id: 2021, code: "PL", name: "Premier League", country: "England", apiLeagueId: 39 },
+  { id: 2014, code: "PD", name: "La Liga", country: "Spain", apiLeagueId: 140 },
+  { id: 2002, code: "BL1", name: "Bundesliga", country: "Germany", apiLeagueId: 78 },
+  { id: 2019, code: "SA", name: "Serie A", country: "Italy", apiLeagueId: 135 },
+  { id: 2015, code: "FL1", name: "Ligue 1", country: "France", apiLeagueId: 61 },
+  { id: 2003, code: "DED", name: "Eredivisie", country: "Netherlands", apiLeagueId: 88 },
+  { id: 2017, code: "PPL", name: "Primeira Liga", country: "Portugal", apiLeagueId: 94 },
 
   // România
-  { id: 3001, code: "RO1", name: "Superliga", country: "Romania", apiLeagueId: 283, season: 2024 },
-  { id: 3002, code: "RO2", name: "Liga 2", country: "Romania", apiLeagueId: 284, season: 2024 }
+  { id: 3001, code: "RO1", name: "Superliga", country: "Romania", apiLeagueId: 283 },
+  { id: 3002, code: "RO2", name: "Liga 2", country: "Romania", apiLeagueId: 284 }
 ];
 
 // ----------------------
-// Helpers – calcule predicții
+// Helpers statistice
 // ----------------------
 function factorial(n) {
   if (n < 0) return 1;
@@ -90,14 +100,21 @@ function poissonProbabilities(lambdaHome, lambdaAway) {
 }
 
 // ----------------------
-// API: competitions
+// /api/competitions
 // ----------------------
 app.get("/api/competitions", (req, res) => {
-  res.json(COMPETITIONS);
+  // trimitem și sezonul curent ca info
+  const season = CURRENT_SEASON;
+  res.json(
+    COMPETITIONS.map((c) => ({
+      ...c,
+      season
+    }))
+  );
 });
 
 // ----------------------
-// API: matches
+// /api/matches
 // ----------------------
 app.get("/api/matches", async (req, res) => {
   try {
@@ -105,16 +122,17 @@ app.get("/api/matches", async (req, res) => {
     const comp = COMPETITIONS.find((x) => x.id === cid);
     if (!comp) return res.json({ matches: [] });
 
-    // luăm direct următoarele 20 meciuri programate
+    const season = CURRENT_SEASON;
+
+    // următoarele 20 meciuri programate
     const fixtures = await apiFetch("/fixtures", {
       league: comp.apiLeagueId,
-      season: comp.season,
+      season,
       next: 20
     });
 
     const upcoming = fixtures.filter((fx) => {
       const s = fx.fixture?.status?.short;
-      // NS = Not Started, TBD = To Be Defined, PST = Postponed (considerăm tot viitor)
       return s === "NS" || s === "TBD" || s === "PST";
     });
 
@@ -124,27 +142,28 @@ app.get("/api/matches", async (req, res) => {
       const homeId = fx.teams.home.id;
       const awayId = fx.teams.away.id;
 
-      // Formă ultimele 5 meciuri
       const homeForm = await apiFetch("/fixtures", {
         team: homeId,
-        season: comp.season,
+        season,
         last: 5
       });
 
       const awayForm = await apiFetch("/fixtures", {
         team: awayId,
-        season: comp.season,
+        season,
         last: 5
       });
 
       const lambdaHome =
         homeForm.length > 0
-          ? homeForm.reduce((s, g) => s + (g.goals?.home ?? 0), 0) / homeForm.length
+          ? homeForm.reduce((s, g) => s + (g.goals?.home ?? 0), 0) /
+            homeForm.length
           : 1.1;
 
       const lambdaAway =
         awayForm.length > 0
-          ? awayForm.reduce((s, g) => s + (g.goals?.away ?? 0), 0) / awayForm.length
+          ? awayForm.reduce((s, g) => s + (g.goals?.away ?? 0), 0) /
+            awayForm.length
           : 1.1;
 
       const total = lambdaHome + lambdaAway || 1;
@@ -160,8 +179,7 @@ app.get("/api/matches", async (req, res) => {
 
       const dist = poissonProbabilities(lambdaHome, lambdaAway);
 
-      const roughBtts =
-        50 + lambdaHome * 15 + lambdaAway * 15; // simplu, dar legat de xG
+      const roughBtts = 50 + lambdaHome * 15 + lambdaAway * 15;
       const bttsYes = Math.max(0, Math.min(100, Math.round(roughBtts)));
       const bttsNo = 100 - bttsYes;
 
@@ -201,7 +219,7 @@ app.get("/api/matches", async (req, res) => {
 });
 
 // ----------------------
-// API: test key
+// /api/test-key
 // ----------------------
 app.get("/api/test-key", (req, res) => {
   res.json({
