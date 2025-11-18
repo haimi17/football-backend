@@ -188,11 +188,17 @@ app.get("/api/matches", async (req, res) => {
     const season = getSeasonYear();
 
     // Fereastră de 7 zile: azi -> azi + 7
-    const now = new Date();
-    const to = new Date(now.getTime() + 7 * 24 * 60 * 60 * 1000);
+    // după – interval mai larg, fără „oracol” :)
+const now = new Date();
 
-    const fromStr = now.toISOString().split("T")[0];
-    const toStr = to.toISOString().split("T")[0];
+// începem de AZI
+const fromDate = now;
+
+// mergem 21 de zile în viitor
+const toDate = new Date(now.getTime() + 21 * 24 * 60 * 60 * 1000);
+
+const fromStr = fromDate.toISOString().split("T")[0];
+const toStr = toDate.toISOString().split("T")[0];
 
     const fixtures = await apiFetch("/fixtures", {
       league: comp.apiLeagueId,
