@@ -188,7 +188,7 @@ app.get("/api/matches", async (req, res) => {
       return res.json(cache.matches[cacheKey].data);
     }
 
-    // luăm următoarele 20 meciuri din ligă (nu mai folosim from/to)
+    // luăm URMĂTOARELE 20 de meciuri
     const fixturesJson = await apiFetch("/fixtures", {
       league: comp.apiLeagueId,
       season: comp.season,
@@ -196,15 +196,18 @@ app.get("/api/matches", async (req, res) => {
       timezone: "Europe/Bucharest"
     });
 
+    const apiErrors = fixturesJson.errors || {};
     const fixtures = fixturesJson.response || [];
 
+    // dacă API-ul nu dă meciuri, trimitem și erorile lui înapoi
     if (fixtures.length === 0) {
       console.log(
-        `Niciun fixture pentru ${comp.name} cu next=20 (league=${comp.apiLeagueId}, season=${comp.season})`
+        `Niciun fixture pentru ${comp.name} (league=${comp.apiLeagueId}, season=${comp.season}), erori:`,
+        apiErrors
       );
-      const empty = { matches: [] };
-      cache.matches[cacheKey] = { data: empty, ts: now };
-      return res.json(empty);
+      const result = { matches: [], apiErrors };
+      cache.matches[cacheKey] = { data: result, ts: now };
+      return res.json(result);
     }
 
     // cache pentru statistics pe echipă
@@ -246,25 +249,18 @@ app.get("/api/matches", async (req, res) => {
       const homeStats = await getTeamStats(homeId);
       const awayStats = await getTeamStats(awayId);
 
-      const homeGF =
-        homeStats?.goals?.for?.total?.home ?? 0;
-      const homeGA =
-        homeStats?.goals?.against?.total?.home ?? 0;
-      const awayGF =
-        awayStats?.goals?.for?.total?.away ?? 0;
-      const awayGA =
-        awayStats?.goals?.against?.total?.away ?? 0;
+      const homeGF = homeStats?.goals?.for?.total?.home ?? 0;
+      const homeGA = homeStats?.goals?.against?.total?.home ?? 0;
+      const awayGF = awayStats?.goals?.for?.total?.away ?? 0;
+      const awayGA = awayStats?.goals?.against?.total?.away ?? 0;
 
-      const homePlayed =
-        homeStats?.fixtures?.played?.home ?? 1;
-      const awayPlayed =
-        awayStats?.fixtures?.played?.away ?? 1;
+      const homePlayed = homeStats?.fixtures?.played?.home ?? 1;
+      const awayPlayed = awayStats?.fixtures?.played?.away ?? 1;
 
       let lambdaHome = (homeGF / homePlayed + awayGA / awayPlayed) / 2;
       let lambdaAway = (awayGF / awayPlayed + homeGA / homePlayed) / 2;
 
-      // mic avantaj teren propriu
-      lambdaHome *= 1.1;
+      lambdaHome *= 1.1; // avantaj teren propriu
       lambdaHome = Math.min(Math.max(lambdaHome, 0.2), 3.5);
       lambdaAway = Math.min(Math.max(lambdaAway, 0.2), 3.5);
 
@@ -313,7 +309,7 @@ app.get("/api/matches", async (req, res) => {
       if (maxProb === probDrawP) mainPick = "DRAW";
       else if (maxProb === probAway) mainPick = "AWAY";
 
-      const matchObj = {
+      out.push({
         id: fixture.id,
         utcDate: fixture.date,
         competition: league?.name || comp.name,
@@ -338,12 +334,10 @@ app.get("/api/matches", async (req, res) => {
             away: lambdaAway
           }
         }
-      };
-
-      out.push(matchObj);
+      });
     }
 
-    const result = { matches: out };
+    const result = { matches: out, apiErrors };
     cache.matches[cacheKey] = { data: result, ts: now };
     res.json(result);
   } catch (err) {
@@ -353,9 +347,4 @@ app.get("/api/matches", async (req, res) => {
       details: String(err.message || err)
     });
   }
-});
-
-// ----------------------
-app.listen(PORT, () => {
-  console.log(`Backend pornit pe port ${PORT}`);
 });
