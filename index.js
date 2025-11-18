@@ -231,7 +231,7 @@ function buildRealConfidence({probHome,probDraw,probAway,context}){
   return {percent:pct,components:{dataQ,sample,clarity,recent},label};
 }
 
-// matchProfile — tip de meci
+// matchProfile
 function getMatchProfile(p){
   const {over25, under25} = p.goals;
   const h=p.probHome, d=p.probDraw, a=p.probAway;
@@ -247,7 +247,7 @@ function getMatchProfile(p){
   return "NEUTRAL";
 }
 
-// dataFlag — calitatea datelor
+// dataFlag
 function getDataFlag(ctx){
   const dq=ctx.dataQuality;
   const sm=ctx.sampleSize;
@@ -300,13 +300,13 @@ function buildPrediction(lambdaHome,lambdaAway,ctx){
     },
     goals:{over25,under25:100-over25},
     btts:{yes:bttsYes,no:100-bttsYes},
-    lambdas:{home:lambdaHome.toFixed(2),away:lambdaAway.toFixed(2)}
+    lambdas:{
+      home: Number(lambdaHome.toFixed(2)),
+      away: Number(lambdaAway.toFixed(2))
+    }
   };
 
-  // ADĂUGĂM matchProfile
   out.matchProfile = getMatchProfile(out);
-
-  // ADĂUGĂM dataFlag
   out.dataFlag = getDataFlag({
     dataQuality: ctx.dataQuality,
     sampleSize: ctx.sampleSize,
