@@ -33,7 +33,7 @@ const COMPETITIONS = [
   // Champions League
   { id: 2001, code: "CL",  name: "UEFA Champions League", country: "Europe", apiLeagueId: 2, season: 2024 },
 
-  // România – ID-urile de ligă pentru API-FOOTBALL
+  // România – Superliga + Liga 2
   { id: 2501, code: "RO1", name: "Superliga",         country: "Romania",  apiLeagueId: 283, season: 2024 },
   { id: 2502, code: "RO2", name: "Liga 2",            country: "Romania",  apiLeagueId: 284, season: 2024 }
 ];
@@ -87,7 +87,7 @@ async function apiFetch(path, params = {}) {
 
 function formScore(formStr) {
   if (!formStr || typeof formStr !== "string") return 0.5;
-  const letters = formStr.trim().split("").slice(-5); // ultimele 5
+  const letters = formStr.trim().split("").slice(-5);
   if (letters.length === 0) return 0.5;
 
   let pts = 0;
@@ -96,7 +96,7 @@ function formScore(formStr) {
     else if (ch === "D") pts += 1;
   }
   const maxPts = letters.length * 3;
-  return maxPts > 0 ? pts / maxPts : 0.5; // 0..1
+  return maxPts > 0 ? pts / maxPts : 0.5;
 }
 
 function clamp(x, min, max) {
@@ -113,7 +113,7 @@ for (let i = 1; i <= 10; i++) {
 
 function poissonProb(k, lambda) {
   if (lambda <= 0) return k === 0 ? 1 : 0;
-  if (k > 10) k = 10; // siguranță
+  if (k > 10) k = 10;
   return Math.exp(-lambda) * Math.pow(lambda, k) / FACT[k];
 }
 
@@ -152,12 +152,11 @@ function buildPoissonModel(lambdaHome, lambdaAway) {
   const pUnder25 = 1 - pOver25;
 
   const pBTTSraw =
-    1 - ph[0] - pa[0] + ph[0] * pa[0]; // 1 - P(H=0) - P(A=0) + P(H=0,A=0)
+    1 - ph[0] - pa[0] + ph[0] * pa[0];
 
-  // shrink spre valori realiste din fotbal (Over2.5 ≈ 52%, BTTS ≈ 50%)
   const PRIOR_OVER25 = 0.52;
   const PRIOR_BTTS = 0.5;
-  const W = 0.6; // 60% model, 40% prior
+  const W = 0.6;
 
   const pOver25Adj = clamp(
     W * pOver25 + (1 - W) * PRIOR_OVER25,
@@ -268,7 +267,7 @@ app.get("/api/matches", async (req, res) => {
     }
 
     const today = new Date();
-    const toDate = new Date(today.getTime() + 4 * 24 * 60 * 60 * 1000);
+    const toDate = new Date(today.getTime() + 7 * 24 * 60 * 60 * 1000);
 
     const fromStr = today.toISOString().split("T")[0];
     const toStr = toDate.toISOString().split("T")[0];
@@ -282,9 +281,10 @@ app.get("/api/matches", async (req, res) => {
 
     const fixtures = fixturesData.response || [];
 
+    const nowTs = Math.floor(Date.now() / 1000);
     const upcoming = fixtures.filter((fx) => {
-      const status = fx.fixture?.status?.short;
-      return status === "NS" || status === "TBD";
+      const ts = fx.fixture?.timestamp;
+      return typeof ts === "number" && ts >= nowTs - 30 * 60; // nu mai vechi de 30 min
     });
 
     const matches = [];
@@ -302,7 +302,6 @@ app.get("/api/matches", async (req, res) => {
       const homeStats = await getTeamStats(homeId, comp);
       const awayStats = await getTeamStats(awayId, comp);
 
-      // lambda-uri de bază
       let lambdaHome =
         0.6 * homeStats.avgGFHome + 0.4 * awayStats.avgGAAway;
       let lambdaAway =
@@ -311,8 +310,7 @@ app.get("/api/matches", async (req, res) => {
       lambdaHome = clamp(lambdaHome, 0.3, 3.5);
       lambdaAway = clamp(lambdaAway, 0.3, 3.5);
 
-      // ajustare formă (diferență home vs away)
-      const diffForm = homeStats.formScore - awayStats.formScore; // -1..1
+      const diffForm = homeStats.formScore - awayStats.formScore;
       const formFactorHome = clamp(1 + diffForm * 0.2, 0.8, 1.2);
       const formFactorAway = clamp(1 - diffForm * 0.2, 0.8, 1.2);
 
