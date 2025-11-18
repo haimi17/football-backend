@@ -1,172 +1,82 @@
 import express from "express";
-import cors from "cors";
 import fetch from "node-fetch";
+import cors from "cors";
 
 const app = express();
-const PORT = process.env.PORT || 3000;
-
-const API_KEY = process.env.API_FOOTBALL_KEY;
-const API_BASE = "https://v3.football.api-sports.io";
-
 app.use(cors());
-app.use(express.json());
 
-// ----------------------
-// Config competiții
-// ----------------------
+const PORT = process.env.PORT || 3000;
+const API_KEY = process.env.API_FOOTBALL_KEY;
+
+// ---------------------------
+// COMPETIȚII SUPORTATE
+// ---------------------------
 const COMPETITIONS = [
-  {
-    id: 39,
-    code: "PL",
-    name: "Premier League",
-    country: "England",
-    apiLeagueId: 39,
-    season: 2024
-  },
-  {
-    id: 135,
-    code: "SA",
-    name: "Serie A",
-    country: "Italy",
-    apiLeagueId: 135,
-    season: 2024
-  },
-  {
-    id: 140,
-    code: "PD",
-    name: "La Liga",
-    country: "Spain",
-    apiLeagueId: 140,
-    season: 2024
-  },
-  {
-    id: 61,
-    code: "L1",
-    name: "Ligue 1",
-    country: "France",
-    apiLeagueId: 61,
-    season: 2024
-  },
-  {
-    id: 78,
-    code: "BL1",
-    name: "Bundesliga",
-    country: "Germany",
-    apiLeagueId: 78,
-    season: 2024
-  },
-  {
-    id: 88,
-    code: "DED",
-    name: "Eredivisie",
-    country: "Netherlands",
-    apiLeagueId: 88,
-    season: 2024
-  },
-  {
-    id: 283,
-    code: "RO1",
-    name: "Superliga",
-    country: "Romania",
-    apiLeagueId: 283,
-    season: 2024
-  },
-  {
-    id: 284,
-    code: "RO2",
-    name: "Liga 2",
-    country: "Romania",
-    apiLeagueId: 284,
-    season: 2024
-  }
+  { id: 39, code: "PL", name: "Premier League", country: "England", apiLeagueId: 39, season: 2024 },
+  { id: 135, code: "SA", name: "Serie A", country: "Italy", apiLeagueId: 135, season: 2024 },
+  { id: 140, code: "PD", name: "La Liga", country: "Spain", apiLeagueId: 140, season: 2024 },
+  { id: 61, code: "L1", name: "Ligue 1", country: "France", apiLeagueId: 61, season: 2024 },
+  { id: 78, code: "BL1", name: "Bundesliga", country: "Germany", apiLeagueId: 78, season: 2024 },
+  { id: 88, code: "DED", name: "Eredivisie", country: "Netherlands", apiLeagueId: 88, season: 2024 },
+  { id: 283, code: "RO1", name: "Superliga", country: "Romania", apiLeagueId: 283, season: 2024 },
+  { id: 284, code: "RO2", name: "Liga 2", country: "Romania", apiLeagueId: 284, season: 2024 }
 ];
 
-// cache simplu în memorie
-const CACHE_TTL = 60 * 1000;
+// ---------------------------
+// CACHE LOCAL
+// ---------------------------
 const cache = {
-  competitions: { data: null, ts: 0 },
-  matches: {}
+  matches: {}  // cache.matches[competitionId] = { data, ts }
 };
 
-// ----------------------
-// Helper pentru API-FOOTBALL
-// ----------------------
+const CACHE_TTL = 1000 * 60 * 10; // 10 minute
+
+// ---------------------------
+// FUNCȚIE PENTRU API-FOOTBALL
+// ---------------------------
 async function apiFetch(endpoint, params = {}) {
-  if (!API_KEY) {
-    throw new Error("API_FOOTBALL_KEY lipsă în backend");
-  }
+  const BASE = "https://v3.football.api-sports.io";
+  const query = new URLSearchParams(params).toString();
+  const url = `${BASE}${endpoint}?${query}`;
 
-  const url = new URL(API_BASE + endpoint);
-  Object.entries(params).forEach(([k, v]) =>
-    url.searchParams.append(k, String(v))
-  );
-
-  const res = await fetch(url.toString(), {
-    method: "GET",
+  const res = await fetch(url, {
     headers: {
-      "x-apisports-key": API_KEY,
-      "x-rapidapi-host": "v3.football.api-sports.io"
+      "x-apisports-key": API_KEY
     }
   });
 
-  if (!res.ok) {
-    const txt = await res.text();
-    throw new Error(`HTTP ${res.status} la ${endpoint}: ${txt}`);
-  }
-
   const json = await res.json();
-
-  // doar logăm eventualele erori ale API-ului, nu oprim execuția
-  if (json.errors && Object.keys(json.errors).length > 0) {
-    console.error("Erori API-FOOTBALL la", endpoint, json.errors);
-  }
-
   return json;
 }
 
-// Poisson PMF
-function poissonPMF(lambda, k) {
-  if (lambda <= 0) return 0;
-  let num = Math.exp(-lambda);
-  for (let i = 1; i <= k; i++) {
-    num *= lambda / i;
-  }
-  return num;
+// ---------------------------
+// FUNCȚII MATEMATICE
+// ---------------------------
+function factorial(n) {
+  return n <= 1 ? 1 : n * factorial(n - 1);
 }
 
-// ----------------------
-// Test cheie
-// ----------------------
-app.get("/api/test-key", (req, res) => {
-  if (!API_KEY) {
-    return res.json({ ok: false, message: "Cheie lipsă" });
-  }
-  return res.json({ ok: true, message: "Cheie OK" });
+function poissonPMF(lambda, k) {
+  return (Math.exp(-lambda) * Math.pow(lambda, k)) / factorial(k);
+}
+
+// ---------------------------
+// ROUTE: /api/status
+// ---------------------------
+app.get("/api/status", (req, res) => {
+  res.json({ ok: true, message: "Cheie OK" });
 });
 
-// ----------------------
-// Competitions
-// ----------------------
+// ---------------------------
+// ROUTE: /api/competitions
+// ---------------------------
 app.get("/api/competitions", (req, res) => {
-  const now = Date.now();
-  if (cache.competitions.data && now - cache.competitions.ts < CACHE_TTL) {
-    return res.json(cache.competitions.data);
-  }
-
-  const list = COMPETITIONS.map((c) => ({
-    id: c.id,
-    code: c.code,
-    name: c.name,
-    country: c.country
-  }));
-
-  cache.competitions = { data: list, ts: now };
-  res.json(list);
+  res.json(COMPETITIONS);
 });
 
-// ----------------------
-// Matches + predicții
-// ----------------------
+// ---------------------------
+// ROUTE: /api/matches
+// ---------------------------
 app.get("/api/matches", async (req, res) => {
   try {
     const competitionId = Number(req.query.competitionId);
@@ -181,6 +91,8 @@ app.get("/api/matches", async (req, res) => {
 
     const cacheKey = String(competitionId);
     const now = Date.now();
+
+    // returnăm din cache dacă e proaspăt
     if (
       cache.matches[cacheKey] &&
       now - cache.matches[cacheKey].ts < CACHE_TTL
@@ -188,7 +100,9 @@ app.get("/api/matches", async (req, res) => {
       return res.json(cache.matches[cacheKey].data);
     }
 
-    // luăm URMĂTOARELE 20 de meciuri
+    // --------------------------------------------------------
+    // LUĂM URMĂTOARELE 20 DE MECIURI VIA API-FOOTBALL
+    // --------------------------------------------------------
     const fixturesJson = await apiFetch("/fixtures", {
       league: comp.apiLeagueId,
       season: comp.season,
@@ -199,18 +113,20 @@ app.get("/api/matches", async (req, res) => {
     const apiErrors = fixturesJson.errors || {};
     const fixtures = fixturesJson.response || [];
 
-    // dacă API-ul nu dă meciuri, trimitem și erorile lui înapoi
+    // Dacă nu avem meciuri → returnăm și erorile API
     if (fixtures.length === 0) {
       console.log(
-        `Niciun fixture pentru ${comp.name} (league=${comp.apiLeagueId}, season=${comp.season}), erori:`,
+        `[INFO] Niciun fixture pentru ${comp.name}. API errors:`,
         apiErrors
       );
-      const result = { matches: [], apiErrors };
-      cache.matches[cacheKey] = { data: result, ts: now };
-      return res.json(result);
+      const data = { matches: [], apiErrors };
+      cache.matches[cacheKey] = { data, ts: now };
+      return res.json(data);
     }
 
-    // cache pentru statistics pe echipă
+    // --------------------------------------------------------
+    // STATISTICI PE ECHIPE
+    // --------------------------------------------------------
     const teamStatsCache = {};
 
     async function getTeamStats(teamId) {
@@ -234,14 +150,10 @@ app.get("/api/matches", async (req, res) => {
       const league = fx.league;
       const teams = fx.teams;
 
-      if (!fixture || !teams?.home?.id || !teams?.away?.id) {
-        continue;
-      }
+      if (!fixture || !teams?.home?.id || !teams?.away?.id) continue;
 
       const status = fixture.status?.short;
-      if (status && status !== "NS" && status !== "TBD") {
-        continue;
-      }
+      if (status && status !== "NS" && status !== "TBD") continue;
 
       const homeId = teams.home.id;
       const awayId = teams.away.id;
@@ -261,6 +173,7 @@ app.get("/api/matches", async (req, res) => {
       let lambdaAway = (awayGF / awayPlayed + homeGA / homePlayed) / 2;
 
       lambdaHome *= 1.1; // avantaj teren propriu
+
       lambdaHome = Math.min(Math.max(lambdaHome, 0.2), 3.5);
       lambdaAway = Math.min(Math.max(lambdaAway, 0.2), 3.5);
 
@@ -337,9 +250,9 @@ app.get("/api/matches", async (req, res) => {
       });
     }
 
-    const result = { matches: out, apiErrors };
-    cache.matches[cacheKey] = { data: result, ts: now };
-    res.json(result);
+    const data = { matches: out, apiErrors };
+    cache.matches[cacheKey] = { data, ts: now };
+    res.json(data);
   } catch (err) {
     console.error("Eroare /api/matches:", err);
     res.status(500).json({
@@ -347,4 +260,11 @@ app.get("/api/matches", async (req, res) => {
       details: String(err.message || err)
     });
   }
+});
+
+// ---------------------------
+// PORNIRE SERVER
+// ---------------------------
+app.listen(PORT, () => {
+  console.log(`Backend ready on port ${PORT}`);
 });
