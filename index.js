@@ -35,7 +35,7 @@ async function apiFetch(endpoint, params) {
 }
 
 // ----------------------
-// Competitions — hardcoded profi
+// Competitions — hardcoded
 // ----------------------
 const COMPETITIONS = [
   { id: 2021, code: "PL", name: "Premier League", country: "England", apiLeagueId: 39, season: 2024 },
@@ -54,11 +54,6 @@ const COMPETITIONS = [
 // ----------------------
 // Helpers – calcule predicții
 // ----------------------
-function poisson(lambda, k) {
-  const e = Math.exp(-lambda);
-  return (Math.pow(lambda, k) * e) / factorial(k);
-}
-
 function factorial(n) {
   if (n < 0) return 1;
   let r = 1;
@@ -66,8 +61,15 @@ function factorial(n) {
   return r;
 }
 
+function poisson(lambda, k) {
+  const e = Math.exp(-lambda);
+  return (Math.pow(lambda, k) * e) / factorial(k);
+}
+
 function poissonProbabilities(lambdaHome, lambdaAway) {
-  let over15 = 0, over25 = 0, over35 = 0;
+  let over15 = 0,
+    over25 = 0,
+    over35 = 0;
 
   for (let h = 0; h <= 6; h++) {
     for (let a = 0; a <= 6; a++) {
@@ -103,22 +105,17 @@ app.get("/api/matches", async (req, res) => {
     const comp = COMPETITIONS.find((x) => x.id === cid);
     if (!comp) return res.json({ matches: [] });
 
-    const today = new Date();
-    const toDate = new Date(today.getTime() + 7 * 24 * 60 * 60 * 1000);
-    const fromStr = today.toISOString().split("T")[0];
-    const toStr = toDate.toISOString().split("T")[0];
-
-    // Fixtures
+    // luăm direct următoarele 20 meciuri programate
     const fixtures = await apiFetch("/fixtures", {
       league: comp.apiLeagueId,
       season: comp.season,
-      from: fromStr,
-      to: toStr
+      next: 20
     });
 
     const upcoming = fixtures.filter((fx) => {
       const s = fx.fixture?.status?.short;
-      return s === "NS" || s === "TBD";
+      // NS = Not Started, TBD = To Be Defined, PST = Postponed (considerăm tot viitor)
+      return s === "NS" || s === "TBD" || s === "PST";
     });
 
     const out = [];
@@ -127,7 +124,7 @@ app.get("/api/matches", async (req, res) => {
       const homeId = fx.teams.home.id;
       const awayId = fx.teams.away.id;
 
-      // Formă din ultimele 5 meciuri
+      // Formă ultimele 5 meciuri
       const homeForm = await apiFetch("/fixtures", {
         team: homeId,
         season: comp.season,
@@ -140,37 +137,32 @@ app.get("/api/matches", async (req, res) => {
         last: 5
       });
 
-      // Medii goluri
       const lambdaHome =
         homeForm.length > 0
-          ? homeForm.reduce((s, g) => s + g.goals.home, 0) / homeForm.length
+          ? homeForm.reduce((s, g) => s + (g.goals?.home ?? 0), 0) / homeForm.length
           : 1.1;
 
       const lambdaAway =
         awayForm.length > 0
-          ? awayForm.reduce((s, g) => s + g.goals.away, 0) / awayForm.length
+          ? awayForm.reduce((s, g) => s + (g.goals?.away ?? 0), 0) / awayForm.length
           : 1.1;
 
-      // Prob. 1X2 simple
       const total = lambdaHome + lambdaAway || 1;
       const probHome = Math.round((lambdaHome / total) * 100);
       const probAway = Math.round((lambdaAway / total) * 100);
       const probDraw = Math.max(0, 100 - probHome - probAway);
 
-      // Pick
       let pick = "DRAW";
       if (probHome > probAway && probHome > probDraw) pick = "HOME";
       if (probAway > probHome && probAway > probDraw) pick = "AWAY";
 
       const confidence = Math.max(probHome, probAway, probDraw);
 
-      // Goluri probabilități
       const dist = poissonProbabilities(lambdaHome, lambdaAway);
 
-      // BTTS (aprox)
-      const bttsYes = Math.round((lambdaHome / 3) * 100) < 100
-        ? Math.round(50 + lambdaHome * 15 + lambdaAway * 15)
-        : 65;
+      const roughBtts =
+        50 + lambdaHome * 15 + lambdaAway * 15; // simplu, dar legat de xG
+      const bttsYes = Math.max(0, Math.min(100, Math.round(roughBtts)));
       const bttsNo = 100 - bttsYes;
 
       out.push({
