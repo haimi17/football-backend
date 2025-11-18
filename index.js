@@ -78,37 +78,46 @@ app.get("/api/competitions", (req, res) => {
 // ROUTE: /api/matches
 // ---------------------------
 app.get("/api/matches", async (req, res) => {
+  const leagueId = req.query.leagueId;
+  const season = req.query.season || 2024;
+
+  const today = new Date();
+  const end = new Date();
+  end.setDate(today.getDate() + 21);
+
+  const fromDate = today.toISOString().split("T")[0];
+  const toDate = end.toISOString().split("T")[0];
+
   try {
-    const competitionId = Number(req.query.competitionId);
-    if (!competitionId) {
-      return res.status(400).json({ error: "competitionId lipsă" });
+    const apiRes = await fetch(
+      `https://v3.football.api-sports.io/fixtures?league=${leagueId}&season=${season}&from=${fromDate}&to=${toDate}`,
+      {
+        headers: { "x-apisports-key": process.env.API_KEY }
+      }
+    );
+
+    const apiData = await apiRes.json();
+
+    if (!apiData.response) {
+      return res.json({
+        matches: [],
+        apiErrors: ["API nu a trimis câmpul response"]
+      });
     }
 
-    const comp = COMPETITIONS.find((c) => c.id === competitionId);
-    if (!comp) {
-      return res.status(400).json({ error: "competitionId necunoscut" });
-    }
-
-    const cacheKey = String(competitionId);
-    const now = Date.now();
-
-    // returnăm din cache dacă e proaspăt
-    if (
-      cache.matches[cacheKey] &&
-      now - cache.matches[cacheKey].ts < CACHE_TTL
-    ) {
-      return res.json(cache.matches[cacheKey].data);
-    }
-
-    // --------------------------------------------------------
-    // LUĂM URMĂTOARELE 20 DE MECIURI VIA API-FOOTBALL
-    // --------------------------------------------------------
-    const fixturesJson = await apiFetch("/fixtures", {
-      league: comp.apiLeagueId,
-      season: comp.season,
-      next: 20,
-      timezone: "Europe/Bucharest"
+    return res.json({
+      matches: apiData.response,
+      apiErrors: apiData.errors || []
     });
+
+  } catch (err) {
+    console.error("Eroare reală API:", err);
+    return res.json({
+      matches: [],
+      apiErrors: ["Eroare la fetch", String(err)]
+    });
+  }
+});
 
     const apiErrors = fixturesJson.errors || {};
     const fixtures = fixturesJson.response || [];
