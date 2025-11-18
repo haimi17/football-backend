@@ -5,7 +5,7 @@ import cors from "cors";
 const app = express();
 app.use(cors());
 
-const API_KEY = process.env.API_KEY; 
+const API_KEY = process.env.API_FOOTBALL_KEY; 
 const API_URL = "https://v3.football.api-sports.io";
 
 function delay(ms) {
