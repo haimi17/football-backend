@@ -17,16 +17,27 @@ if (!API_KEY) {
 
 const API_BASE = "https://v3.football.api-sports.io";
 
+// sezonul actual: pentru fotbal european, sezonul începe vara
+function getCurrentSeason() {
+  const now = new Date();
+  const year = now.getFullYear();
+  const month = now.getMonth() + 1; // 1–12
+  // dacă suntem din iulie încolo, sezonul începe în anul curent
+  return month >= 7 ? year : year - 1;
+}
+
+const CURRENT_SEASON = getCurrentSeason();
+
 // Ligile din frontend
 const COMPETITIONS = [
-  { id: 39, code: "PL", name: "Premier League", country: "England", apiLeagueId: 39, season: 2024 },
-  { id: 135, code: "SA", name: "Serie A", country: "Italy", apiLeagueId: 135, season: 2024 },
-  { id: 140, code: "PD", name: "La Liga", country: "Spain", apiLeagueId: 140, season: 2024 },
-  { id: 61, code: "L1", name: "Ligue 1", country: "France", apiLeagueId: 61, season: 2024 },
-  { id: 78, code: "BL1", name: "Bundesliga", country: "Germany", apiLeagueId: 78, season: 2024 },
-  { id: 88, code: "DED", name: "Eredivisie", country: "Netherlands", apiLeagueId: 88, season: 2024 },
-  { id: 283, code: "RO1", name: "Superliga", country: "Romania", apiLeagueId: 283, season: 2024 },
-  { id: 284, code: "RO2", name: "Liga 2", country: "Romania", apiLeagueId: 284, season: 2024 }
+  { id: 39, code: "PL", name: "Premier League", country: "England", apiLeagueId: 39, season: CURRENT_SEASON },
+  { id: 135, code: "SA", name: "Serie A", country: "Italy", apiLeagueId: 135, season: CURRENT_SEASON },
+  { id: 140, code: "PD", name: "La Liga", country: "Spain", apiLeagueId: 140, season: CURRENT_SEASON },
+  { id: 61, code: "L1", name: "Ligue 1", country: "France", apiLeagueId: 61, season: CURRENT_SEASON },
+  { id: 78, code: "BL1", name: "Bundesliga", country: "Germany", apiLeagueId: 78, season: CURRENT_SEASON },
+  { id: 88, code: "DED", name: "Eredivisie", country: "Netherlands", apiLeagueId: 88, season: CURRENT_SEASON },
+  { id: 283, code: "RO1", name: "Superliga", country: "Romania", apiLeagueId: 283, season: CURRENT_SEASON },
+  { id: 284, code: "RO2", name: "Liga 2", country: "Romania", apiLeagueId: 284, season: CURRENT_SEASON }
 ];
 
 // cache pentru statistici de echipă
@@ -416,5 +427,5 @@ app.get("/api/matches", async (req, res) => {
 
 // pornește serverul
 app.listen(PORT, () => {
-  console.log(`Backend ready pe portul ${PORT}`);
+  console.log(`Backend ready pe portul ${PORT} | sezon curent ${CURRENT_SEASON}`);
 });
