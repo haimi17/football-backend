@@ -1,7 +1,7 @@
-// index.js - backend API-FOOTBALL pentru Football Pro Analyzer
+// index.js - backend API-FOOTBALL pentru Football Pro Analyzer (ES module)
 
-const express = require("express");
-const cors = require("cors");
+import express from "express";
+import cors from "cors";
 
 // -------------------------
 // Config
@@ -173,7 +173,6 @@ app.get("/api/matches", async (req, res) => {
     }
 
     // 2) luăm următoarele meciuri cu parametru "next"
-    //    nu mai folosim from/to ca să evităm problemele de calendar
     let fixturesJson;
     try {
       fixturesJson = await apiFetch("/fixtures", {
@@ -255,14 +254,14 @@ app.get("/api/matches", async (req, res) => {
         }
       }
 
-      // rotunjire în procente
+      // procente
       const probHomePct = Math.round(probHomeWin * 100);
       const probDrawPct = Math.round(probDraw * 100);
       const probAwayPct = Math.round(probAwayWin * 100);
       const over25Pct = Math.round(probOver25 * 100);
       const bttsYesPct = Math.round(probBTTS * 100);
 
-      // alegere pronostic principal
+      // pronostic principal
       let mainPick = "HOME";
       let best = probHomePct;
 
@@ -275,8 +274,7 @@ app.get("/api/matches", async (req, res) => {
         mainPick = "AWAY";
       }
 
-      // "încredere" = cel mai mare procent dintre 1/X/2,
-      // tăiat între 40% și 80% ca să nu devină "oracol"
+      // încredere limitată 40–80
       let confidence = best;
       confidence = Math.max(confidence, 40);
       confidence = Math.min(confidence, 80);
