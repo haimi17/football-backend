@@ -1,11 +1,8 @@
-// index.js - backend API-FOOTBALL pentru Football Pro Analyzer (ES module)
+// index.js – backend API-FOOTBALL pentru Football Pro Analyzer
 
 import express from "express";
 import cors from "cors";
-
-// -------------------------
-// Config
-// -------------------------
+import fetch from "node-fetch";
 
 const app = express();
 app.use(cors());
@@ -20,310 +17,273 @@ if (!API_KEY) {
 
 const API_BASE = "https://v3.football.api-sports.io";
 
-// competițiile pe care le afișăm în frontend
+// Ligile folosite de frontend
+// apiLeagueId + season vin direct din API-FOOTBALL (ex: sezon 2024 = 2024/2025)
 const COMPETITIONS = [
-  { id: 39, code: "PL",  name: "Premier League", country: "England",  apiLeagueId: 39,  season: 2024 },
-  { id: 135, code: "SA", name: "Serie A",        country: "Italy",    apiLeagueId: 135, season: 2024 },
-  { id: 140, code: "PD", name: "La Liga",        country: "Spain",    apiLeagueId: 140, season: 2024 },
-  { id: 61,  code: "L1", name: "Ligue 1",        country: "France",   apiLeagueId: 61,  season: 2024 },
-  { id: 78,  code: "BL1",name: "Bundesliga",     country: "Germany",  apiLeagueId: 78,  season: 2024 },
+  { id: 39, code: "PL",  name: "Premier League", country: "England",   apiLeagueId: 39,  season: 2024 },
+  { id: 135, code: "SA", name: "Serie A",        country: "Italy",     apiLeagueId: 135, season: 2024 },
+  { id: 140, code: "PD", name: "La Liga",        country: "Spain",     apiLeagueId: 140, season: 2024 },
+  { id: 61,  code: "L1", name: "Ligue 1",        country: "France",    apiLeagueId: 61,  season: 2024 },
+  { id: 78,  code: "BL1",name: "Bundesliga",     country: "Germany",   apiLeagueId: 78,  season: 2024 },
   { id: 88,  code: "DED",name: "Eredivisie",     country: "Netherlands", apiLeagueId: 88, season: 2024 },
-  { id: 283, code: "RO1",name: "Superliga",      country: "Romania",  apiLeagueId: 283, season: 2024 },
-  { id: 284, code: "RO2",name: "Liga 2",         country: "Romania",  apiLeagueId: 284, season: 2024 }
+  { id: 283, code: "RO1",name: "Superliga",      country: "Romania",   apiLeagueId: 283, season: 2024 },
+  { id: 284, code: "RO2",name: "Liga 2",         country: "Romania",   apiLeagueId: 284, season: 2024 }
 ];
 
-// -------------------------
-// Helper pentru apel API-FOOTBALL
-// -------------------------
-
-async function apiFetch(endpoint, params = {}) {
-  const qs = new URLSearchParams();
-
-  Object.entries(params).forEach(([key, value]) => {
-    if (value !== undefined && value !== null && value !== "") {
-      qs.append(key, String(value));
+// Helper general pentru apel API-FOOTBALL
+async function apiFetch(path, params = {}) {
+  const url = new URL(API_BASE + path);
+  Object.entries(params).forEach(([k, v]) => {
+    if (v !== undefined && v !== null && v !== "") {
+      url.searchParams.set(k, String(v));
     }
   });
 
-  const url = `${API_BASE}${endpoint}?${qs.toString()}`;
-
-  const res = await fetch(url, {
+  const res = await fetch(url.toString(), {
     method: "GET",
     headers: {
       "x-apisports-key": API_KEY,
-      accept: "application/json"
+      "Accept": "application/json"
     }
   });
 
-  const json = await res.json().catch(() => ({}));
-
   if (!res.ok) {
-    const msg =
-      (json && json.message) ||
-      (json && json.errors && JSON.stringify(json.errors)) ||
-      `Status ${res.status}`;
-    throw new Error(msg);
+    const text = await res.text().catch(() => "");
+    throw new Error(`API status ${res.status} la ${path}: ${text}`);
   }
 
-  return json;
+  const data = await res.json();
+  return data;
 }
 
-// factorial mic pentru Poisson
-const FACT = [1, 1, 2, 6, 24, 120, 720, 5040];
-
+// Poisson helpers pentru goluri și over/BTTS
+const FACT = [1];
+for (let i = 1; i <= 10; i++) {
+  FACT[i] = FACT[i - 1] * i;
+}
 function poissonPMF(lambda, k) {
-  if (!Number.isFinite(lambda) || lambda <= 0) return 0;
-  if (k < 0 || k >= FACT.length) return 0;
-  return Math.pow(lambda, k) * Math.exp(-lambda) / FACT[k];
+  if (lambda <= 0) return k === 0 ? 1 : 0;
+  return Math.exp(-lambda) * Math.pow(lambda, k) / FACT[k];
 }
 
-function safeNumber(v, fallback) {
-  const n = Number(v);
-  return Number.isFinite(n) ? n : fallback;
-}
-
-// -------------------------
-// Rute simple
-// -------------------------
-
-app.get("/", (req, res) => {
-  res.send("Football backend OK");
-});
-
-app.get("/api/test-key", (req, res) => {
-  if (!API_KEY) {
-    return res.json({ ok: false, message: "Lipsește API_FOOTBALL_KEY" });
+// Predictie bazată pe clasament (standings)
+function buildPredictionFromStats(homeStats, awayStats) {
+  // fallback neutru
+  if (!homeStats || !awayStats || !homeStats.played || !awayStats.played) {
+    return {
+      probHome: 34,
+      probDraw: 32,
+      probAway: 34,
+      mainPick: "HOME",
+      confidence: 34,
+      goals: { over25: 50, under25: 50 },
+      btts: { yes: 50, no: 50 },
+      lambdas: { home: 1.3, away: 1.2 }
+    };
   }
-  res.json({ ok: true, message: "Cheie OK" });
+
+  const homeGF = homeStats.goalsFor / homeStats.played;
+  const homeGA = homeStats.goalsAgainst / homeStats.played;
+  const awayGF = awayStats.goalsFor / awayStats.played;
+  const awayGA = awayStats.goalsAgainst / awayStats.played;
+
+  let lambdaHome = (homeGF + awayGA) / 2;
+  let lambdaAway = (awayGF + homeGA) / 2;
+
+  // avantaj teren propriu
+  lambdaHome *= 1.15;
+
+  // limite xG
+  lambdaHome = Math.min(Math.max(lambdaHome, 0.3), 3.5);
+  lambdaAway = Math.min(Math.max(lambdaAway, 0.3), 3.5);
+
+  const maxGoals = 7;
+  const pHome = [];
+  const pAway = [];
+  for (let k = 0; k <= maxGoals; k++) {
+    pHome[k] = poissonPMF(lambdaHome, k);
+    pAway[k] = poissonPMF(lambdaAway, k);
+  }
+
+  let probHomeWin = 0;
+  let probDraw = 0;
+  let probAwayWin = 0;
+  let probOver25 = 0;
+  let probBTTS = 0;
+
+  for (let h = 0; h <= maxGoals; h++) {
+    for (let a = 0; a <= maxGoals; a++) {
+      const p = pHome[h] * pAway[a];
+
+      if (h > a) probHomeWin += p;
+      else if (h === a) probDraw += p;
+      else probAwayWin += p;
+
+      if (h + a >= 3) probOver25 += p;
+      if (h > 0 && a > 0) probBTTS += p;
+    }
+  }
+
+  let pH = probHomeWin;
+  let pD = probDraw;
+  let pA = probAwayWin;
+  const sum = pH + pD + pA || 1;
+  pH /= sum;
+  pD /= sum;
+  pA /= sum;
+
+  const percHome = Math.round(pH * 100);
+  const percDraw = Math.round(pD * 100);
+  const percAway = Math.round(pA * 100);
+
+  let mainPick = "HOME";
+  let maxProb = pH;
+  if (pD > maxProb) {
+    mainPick = "DRAW";
+    maxProb = pD;
+  }
+  if (pA > maxProb) {
+    mainPick = "AWAY";
+    maxProb = pA;
+  }
+
+  const over25 = Math.round(Math.min(Math.max(probOver25 * 100, 5), 95));
+  const bttsYes = Math.round(Math.min(Math.max(probBTTS * 100, 5), 95));
+
+  const confidence = Math.round(maxProb * 100);
+
+  return {
+    probHome: percHome,
+    probDraw: percDraw,
+    probAway: percAway,
+    mainPick,
+    confidence,
+    goals: {
+      over25,
+      under25: 100 - over25
+    },
+    btts: {
+      yes: bttsYes,
+      no: 100 - bttsYes
+    },
+    lambdas: {
+      home: Number(lambdaHome.toFixed(2)),
+      away: Number(lambdaAway.toFixed(2))
+    }
+  };
+}
+
+// =======================================
+// Rute API
+// =======================================
+
+// Test cheie
+app.get("/api/key", (req, res) => {
+  res.json({
+    ok: !!API_KEY,
+    message: API_KEY ? "Cheie OK" : "Cheie lipsă"
+  });
 });
 
-app.get("/api/competitions", (req, res) => {
-  res.json(COMPETITIONS);
+// Listează ligile către frontend
+app.get("/api/leagues", (req, res) => {
+  const list = COMPETITIONS.map((c) => ({
+    id: c.id,
+    code: c.code,
+    name: c.name,
+    country: c.country,
+    apiLeagueId: c.apiLeagueId,
+    season: c.season
+  }));
+  res.json(list);
 });
 
-// -------------------------
-// Rută principală: /api/matches
-// -------------------------
-
+// /api/matches?competitionId=39  sau ?leagueId=39
 app.get("/api/matches", async (req, res) => {
-  const competitionId = Number(req.query.competitionId || req.query.league);
-  const comp = COMPETITIONS.find((c) => c.id === competitionId);
+  const compId = Number(req.query.competitionId || req.query.leagueId);
 
+  const comp = COMPETITIONS.find((c) => c.id === compId);
   if (!comp) {
-    return res.status(400).json({
-      matches: [],
-      apiErrors: ["Competiție invalidă"]
-    });
+    return res.json({ matches: [], apiErrors: ["Competiție necunoscută"] });
   }
-
-  const apiErrors = [];
 
   try {
-    // 1) preluăm clasamentul pentru a calcula medii de goluri
-    let teamStatsMap = new Map();
-
-    try {
-      const standingsJson = await apiFetch("/standings", {
-        league: comp.apiLeagueId,
-        season: comp.season
-      });
-
-      const standingsResp = standingsJson.response?.[0]?.league?.standings?.[0];
-
-      if (Array.isArray(standingsResp)) {
-        for (const row of standingsResp) {
-          const teamId = row.team?.id;
-          if (!teamId) continue;
-
-          teamStatsMap.set(teamId, {
-            homePlayed: safeNumber(row.home?.played, 1),
-            homeGF: safeNumber(row.home?.goals?.for, 1),
-            homeGA: safeNumber(row.home?.goals?.against, 1),
-            awayPlayed: safeNumber(row.away?.played, 1),
-            awayGF: safeNumber(row.away?.goals?.for, 1),
-            awayGA: safeNumber(row.away?.goals?.against, 1)
-          });
-        }
-      } else {
-        apiErrors.push("Standings lipsă sau format necunoscut");
-      }
-    } catch (err) {
-      console.error("Eroare la standings:", err.message);
-      apiErrors.push("Eroare la standings: " + err.message);
-    }
-
-    // funcție locală pentru a obține medii GF/GA
-    function getTeamModel(teamId) {
-      const row = teamStatsMap.get(teamId);
-      if (!row) {
-        return {
-          homeGF: 1.4,
-          homeGA: 1.2,
-          awayGF: 1.2,
-          awayGA: 1.4
-        };
-      }
-
-      const homeGF = row.homeGF / Math.max(1, row.homePlayed);
-      const homeGA = row.homeGA / Math.max(1, row.homePlayed);
-      const awayGF = row.awayGF / Math.max(1, row.awayPlayed);
-      const awayGA = row.awayGA / Math.max(1, row.awayPlayed);
-
-      return { homeGF, homeGA, awayGF, awayGA };
-    }
-
-    // 2) luăm următoarele meciuri cu parametru "next"
-    let fixturesJson;
-    try {
-      fixturesJson = await apiFetch("/fixtures", {
-        league: comp.apiLeagueId,
-        season: comp.season,
-        next: 20,
-        timezone: "Europe/Bucharest"
-      });
-    } catch (err) {
-      console.error("Eroare API-FOOTBALL la /fixtures:", err.message);
-      apiErrors.push("Eroare API-FOOTBALL la /fixtures: " + err.message);
-      return res.json({ matches: [], apiErrors });
-    }
-
-    const fixtures = Array.isArray(fixturesJson.response)
-      ? fixturesJson.response
-      : [];
-
-    const upcoming = fixtures.filter((fx) => {
-      const status = fx?.fixture?.status?.short;
-      return status === "NS" || status === "TBD";
+    // Luăm o singură dată clasamentul pentru ligă
+    const standingsData = await apiFetch("/standings", {
+      league: comp.apiLeagueId,
+      season: comp.season
     });
 
-    const matchesOut = [];
+    const table =
+      standingsData?.response?.[0]?.league?.standings?.[0] || [];
 
-    for (const fx of upcoming) {
+    const teamStats = {};
+    for (const row of table) {
+      const teamId = row.team?.id;
+      if (!teamId) continue;
+      teamStats[teamId] = {
+        rank: row.rank,
+        played: row.all?.played ?? 0,
+        goalsFor: row.all?.goals?.for ?? 0,
+        goalsAgainst: row.all?.goals?.against ?? 0
+      };
+    }
+
+    // Luăm următoarele meciuri (evităm problemele cu from/to)
+    const fixturesData = await apiFetch("/fixtures", {
+      league: comp.apiLeagueId,
+      season: comp.season,
+      next: 50
+    });
+
+    const fixtures = fixturesData.response || [];
+    const out = [];
+
+    const now = new Date();
+
+    for (const fx of fixtures) {
       const fixture = fx.fixture;
       const league = fx.league;
       const teams = fx.teams;
 
-      if (!fixture || !teams?.home?.id || !teams?.away?.id) {
-        continue;
-      }
+      if (!fixture || !teams?.home || !teams?.away) continue;
+
+      const date = new Date(fixture.date);
+      if (isNaN(date.getTime())) continue;
+      if (date < now) continue; // doar viitoare
 
       const homeId = teams.home.id;
       const awayId = teams.away.id;
 
-      const homeModel = getTeamModel(homeId);
-      const awayModel = getTeamModel(awayId);
+      const prediction = buildPredictionFromStats(
+        teamStats[homeId],
+        teamStats[awayId]
+      );
 
-      // λ pentru Poisson
-      let lambdaHome = (homeModel.homeGF + awayModel.awayGA) / 2;
-      let lambdaAway = (awayModel.awayGF + homeModel.homeGA) / 2;
-
-      // avantaj casă
-      lambdaHome *= 1.1;
-
-      // limite rezonabile
-      lambdaHome = Math.min(Math.max(lambdaHome, 0.2), 3.5);
-      lambdaAway = Math.min(Math.max(lambdaAway, 0.2), 3.5);
-
-      // distribuție Poisson până la 7 goluri
-      const maxGoals = 7;
-      const pHome = [];
-      const pAway = [];
-
-      for (let k = 0; k <= maxGoals; k++) {
-        pHome[k] = poissonPMF(lambdaHome, k);
-        pAway[k] = poissonPMF(lambdaAway, k);
-      }
-
-      let probHomeWin = 0;
-      let probDraw = 0;
-      let probAwayWin = 0;
-      let probOver25 = 0;
-      let probBTTS = 0;
-
-      for (let h = 0; h <= maxGoals; h++) {
-        for (let a = 0; a <= maxGoals; a++) {
-          const p = pHome[h] * pAway[a];
-          if (p <= 0) continue;
-
-          if (h > a) probHomeWin += p;
-          else if (h === a) probDraw += p;
-          else probAwayWin += p;
-
-          if (h + a >= 3) probOver25 += p;
-          if (h > 0 && a > 0) probBTTS += p;
-        }
-      }
-
-      // procente
-      const probHomePct = Math.round(probHomeWin * 100);
-      const probDrawPct = Math.round(probDraw * 100);
-      const probAwayPct = Math.round(probAwayWin * 100);
-      const over25Pct = Math.round(probOver25 * 100);
-      const bttsYesPct = Math.round(probBTTS * 100);
-
-      // pronostic principal
-      let mainPick = "HOME";
-      let best = probHomePct;
-
-      if (probDrawPct > best) {
-        best = probDrawPct;
-        mainPick = "DRAW";
-      }
-      if (probAwayPct > best) {
-        best = probAwayPct;
-        mainPick = "AWAY";
-      }
-
-      // încredere limitată 40–80
-      let confidence = best;
-      confidence = Math.max(confidence, 40);
-      confidence = Math.min(confidence, 80);
-
-      matchesOut.push({
+      out.push({
         id: fixture.id,
         utcDate: fixture.date,
         competition: league?.name || comp.name,
         homeTeam: teams.home.name,
         awayTeam: teams.away.name,
-        prediction: {
-          probHome: probHomePct,
-          probDraw: probDrawPct,
-          probAway: probAwayPct,
-          mainPick,
-          confidence,
-          goals: {
-            over25: over25Pct,
-            under25: 100 - over25Pct
-          },
-          btts: {
-            yes: bttsYesPct,
-            no: 100 - bttsYesPct
-          },
-          lambdas: {
-            home: Number(lambdaHome.toFixed(2)),
-            away: Number(lambdaAway.toFixed(2))
-          }
-        }
+        prediction
       });
     }
 
-    return res.json({
-      matches: matchesOut,
-      apiErrors
+    res.json({
+      matches: out,
+      apiErrors: fixturesData?.errors || []
     });
-  } catch (err) {
-    console.error("Eroare generală la /api/matches:", err);
-    return res.status(500).json({
+  } catch (e) {
+    console.error("Eroare /api/matches:", e);
+    res.json({
       matches: [],
-      apiErrors: ["Eroare generală la /api/matches: " + err.message]
+      apiErrors: [e.message || "Eroare necunoscută"]
     });
   }
 });
 
-// -------------------------
 // Pornire server
-// -------------------------
-
 app.listen(PORT, () => {
-  console.log(`Backend ready on port ${PORT}`);
+  console.log(`Backend pornit pe portul ${PORT}`);
 });
