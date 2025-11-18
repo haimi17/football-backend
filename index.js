@@ -54,6 +54,9 @@ async function apiFetch(path, params = {}) {
 // ----------------------
 // Competiții urmărite
 // ----------------------
+// ----------------------
+// Competiții urmărite
+// ----------------------
 const COMPETITIONS = [
   {
     id: 39,
@@ -61,7 +64,7 @@ const COMPETITIONS = [
     name: "Premier League",
     country: "England",
     apiLeagueId: 39,
-    season: 2024
+    season: 2025
   },
   {
     id: 135,
@@ -69,7 +72,7 @@ const COMPETITIONS = [
     name: "Serie A",
     country: "Italy",
     apiLeagueId: 135,
-    season: 2024
+    season: 2025
   },
   {
     id: 140,
@@ -77,7 +80,7 @@ const COMPETITIONS = [
     name: "La Liga",
     country: "Spain",
     apiLeagueId: 140,
-    season: 2024
+    season: 2025
   },
   {
     id: 61,
@@ -85,7 +88,7 @@ const COMPETITIONS = [
     name: "Ligue 1",
     country: "France",
     apiLeagueId: 61,
-    season: 2024
+    season: 2025
   },
   {
     id: 78,
@@ -93,7 +96,7 @@ const COMPETITIONS = [
     name: "Bundesliga",
     country: "Germany",
     apiLeagueId: 78,
-    season: 2024
+    season: 2025
   },
   {
     id: 88,
@@ -101,7 +104,7 @@ const COMPETITIONS = [
     name: "Eredivisie",
     country: "Netherlands",
     apiLeagueId: 88,
-    season: 2024
+    season: 2025
   },
   {
     id: 283,
@@ -109,8 +112,17 @@ const COMPETITIONS = [
     name: "Superliga",
     country: "Romania",
     apiLeagueId: 283,
-    season: 2024
+    season: 2025
   },
+  {
+    id: 284,
+    code: "RO2",
+    name: "Liga 2",
+    country: "Romania",
+    apiLeagueId: 284,
+    season: 2025
+  }
+];
   {
     id: 284,
     code: "RO2",
