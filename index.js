@@ -22,7 +22,6 @@ function getCurrentSeason() {
   const now = new Date();
   const year = now.getFullYear();
   const month = now.getMonth() + 1; // 1–12
-  // dacă suntem din iulie încolo, sezonul începe în anul curent
   return month >= 7 ? year : year - 1;
 }
 
@@ -198,8 +197,68 @@ async function getFixturesForCompetition(comp) {
   return [];
 }
 
+// calculează claritatea distribuției (cât de diferit e pick-ul principal de celelalte)
+function computeDistributionClarity(probHome, probDraw, probAway) {
+  const vals = [probHome, probDraw, probAway];
+  const sorted = [...vals].sort((a, b) => b - a); // desc
+  const top = sorted[0] / 100;     // în 0–1
+  const second = sorted[1] / 100;  // în 0–1
+  const diff = top - second;       // 0–1
+  const clarity = Math.min(1, diff / 0.4); // saturat la 0.4
+  return Number(clarity.toFixed(2));
+}
+
+// calculează un scor de încredere realist (0–100) pe baza datelor
+function buildRealConfidence({ probHome, probDraw, probAway, context }) {
+  let dataQuality = 0.3;
+  let sampleSize = 0.3;
+
+  if (context && typeof context.homeMatchesTotal === "number" && typeof context.awayMatchesTotal === "number") {
+    const homeMatches = context.homeMatchesTotal;
+    const awayMatches = context.awayMatchesTotal;
+
+    // calitatea datelor
+    if (homeMatches >= 5 && awayMatches >= 5) {
+      dataQuality = 1;
+    } else if (homeMatches >= 3 && awayMatches >= 3) {
+      dataQuality = 0.7;
+    } else {
+      dataQuality = 0.4;
+    }
+
+    // mărimea eșantionului
+    const total = homeMatches + awayMatches;
+    sampleSize = Math.min(1, total / 40);
+  }
+
+  const clarity = computeDistributionClarity(probHome, probDraw, probAway);
+
+  // scor total 0–1
+  const score =
+    dataQuality * 0.4 +
+    sampleSize * 0.3 +
+    clarity * 0.3;
+
+  const percent = Math.round(score * 100);
+
+  let label = "scăzută";
+  if (percent >= 60) label = "ridicată";
+  else if (percent >= 40) label = "medie";
+
+  return {
+    score: Number(score.toFixed(2)),
+    percent,
+    label,
+    components: {
+      dataQuality: Number(dataQuality.toFixed(2)),
+      sampleSize: Number(sampleSize.toFixed(2)),
+      clarity
+    }
+  };
+}
+
 // calculează predicția din lambdas
-function buildPredictionFromLambdas(lambdaHome, lambdaAway) {
+function buildPredictionFromLambdas(lambdaHome, lambdaAway, confidenceContext) {
   const maxGoals = 7;
   const pHome = [];
   const pAway = [];
@@ -243,7 +302,17 @@ function buildPredictionFromLambdas(lambdaHome, lambdaAway) {
   ].sort((a, b) => b.val - a.val);
 
   const mainPick = probs[0].key;
-  const confidence = clamp(probs[0].val, 30, 85);
+
+  // scor de încredere realist, nu doar probabilitatea maximă
+  const realConfidence = buildRealConfidence({
+    probHome,
+    probDraw: probDrawPct,
+    probAway,
+    context: confidenceContext
+  });
+
+  // câmpul "confidence" rămâne, dar folosește scorul realist, limitat
+  const confidence = clamp(realConfidence.percent, 25, 75);
 
   return {
     probHome,
@@ -251,6 +320,7 @@ function buildPredictionFromLambdas(lambdaHome, lambdaAway) {
     probAway,
     mainPick,
     confidence,
+    confidenceDetails: realConfidence,
     goals: {
       over25,
       under25
@@ -274,6 +344,12 @@ async function buildPredictionForFixture(comp, fixture) {
   // fallback implicit
   let lambdaHome = 1.35;
   let lambdaAway = 1.25;
+
+  // context pentru încredere
+  let confidenceContext = {
+    homeMatchesTotal: 0,
+    awayMatchesTotal: 0
+  };
 
   if (homeId && awayId) {
     try {
@@ -305,13 +381,18 @@ async function buildPredictionForFixture(comp, fixture) {
 
         lambdaHome = clamp(lambdaHome, 0.4, 2.8);
         lambdaAway = clamp(lambdaAway, 0.4, 2.8);
+
+        confidenceContext = {
+          homeMatchesTotal: homeStats.fixtures?.played?.total || 0,
+          awayMatchesTotal: awayStats.fixtures?.played?.total || 0
+        };
       }
     } catch (e) {
       console.error("Eroare la calculul lambdas:", e.message);
     }
   }
 
-  return buildPredictionFromLambdas(lambdaHome, lambdaAway);
+  return buildPredictionFromLambdas(lambdaHome, lambdaAway, confidenceContext);
 }
 
 // rute
