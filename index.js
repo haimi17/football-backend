@@ -143,6 +143,50 @@ async function getTeamStats(leagueId, season, teamId) {
   }
 }
 
+// ia fixtures pentru o competiție, cu fallback next -> from/to
+async function getFixturesForCompetition(comp) {
+  // 1. următoarele 30 de meciuri
+  try {
+    const byNext = await apiFetchWithRetry("/fixtures", {
+      league: comp.apiLeagueId,
+      season: comp.season,
+      next: 30
+    });
+
+    const fixturesNext = byNext?.response || [];
+    if (Array.isArray(fixturesNext) && fixturesNext.length > 0) {
+      return fixturesNext;
+    }
+  } catch (e) {
+    console.error("Eroare fixtures cu next:", e.message);
+  }
+
+  // 2. fallback: interval 30 zile
+  try {
+    const today = new Date();
+    const from = formatDate(today);
+    const toDate = new Date(today);
+    toDate.setDate(toDate.getDate() + 30);
+    const to = formatDate(toDate);
+
+    const byRange = await apiFetchWithRetry("/fixtures", {
+      league: comp.apiLeagueId,
+      season: comp.season,
+      from,
+      to
+    });
+
+    const fixturesRange = byRange?.response || [];
+    if (Array.isArray(fixturesRange) && fixturesRange.length > 0) {
+      return fixturesRange;
+    }
+  } catch (e) {
+    console.error("Eroare fixtures cu from/to:", e.message);
+  }
+
+  return [];
+}
+
 // calculează predicția din lambdas
 function buildPredictionFromLambdas(lambdaHome, lambdaAway) {
   const maxGoals = 7;
@@ -269,7 +313,7 @@ app.get("/api/test-key", (req, res) => {
   });
 });
 
-// status furnizor (nou)
+// status furnizor
 app.get("/api/provider-status", async (req, res) => {
   if (!API_KEY) {
     return res.json({
@@ -324,24 +368,12 @@ app.get("/api/matches", async (req, res) => {
   const apiErrors = [];
 
   try {
-    const today = new Date();
-    const from = formatDate(today);
-    const toDate = new Date(today);
-    toDate.setDate(toDate.getDate() + 14);
-    const to = formatDate(toDate);
+    const fixtures = await getFixturesForCompetition(comp);
 
-    const fixturesData = await apiFetchWithRetry("/fixtures", {
-      league: comp.apiLeagueId,
-      season: comp.season,
-      from,
-      to
-    });
-
-    const fixtures = fixturesData?.response || [];
     if (!Array.isArray(fixtures) || fixtures.length === 0) {
       return res.json({
         matches: [],
-        apiErrors
+        apiErrors: ["Nu există meciuri programate în perioada cerută"]
       });
     }
 
