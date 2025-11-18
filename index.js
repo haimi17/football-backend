@@ -248,7 +248,8 @@ app.get("/api/matches", async (req, res) => {
       const awayId = teams.away.id;
 
       // Statistici echipe, acasă / deplasare
-      const [homeStats, awayStats] = await Promise.all([
+      // Statistici echipe, acasă / deplasare
+      const [homeStatsRaw, awayStatsRaw] = await Promise.all([
         apiFetch("/teams/statistics", {
           league: comp.apiLeagueId,
           season: comp.season,
@@ -261,11 +262,14 @@ app.get("/api/matches", async (req, res) => {
         })
       ]);
 
-      // Medii goluri
-      const homeGF = homeStats.goals?.for?.average?.home ?? 1;
-      const homeGA = homeStats.goals?.against?.average?.home ?? 1;
-      const awayGF = awayStats.goals?.for?.average?.away ?? 1;
-      const awayGA = awayStats.goals?.against?.average?.away ?? 1;
+      const homeStats = homeStatsRaw.response || {};
+      const awayStats = awayStatsRaw.response || {};
+
+      // Medii goluri (conversie la număr)
+      const homeGF = parseFloat(homeStats.goals?.for?.average?.home) || 1;
+      const homeGA = parseFloat(homeStats.goals?.against?.average?.home) || 1;
+      const awayGF = parseFloat(awayStats.goals?.for?.average?.away) || 1;
+      const awayGA = parseFloat(awayStats.goals?.against?.average?.away) || 1;
 
       // Lambda brute
       let lambdaHome = (homeGF + awayGA) / 2;
