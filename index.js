@@ -39,8 +39,9 @@ const COMPETITIONS = [
   { id: 284, code: "RO2", name: "Liga 2", country: "Romania", apiLeagueId: 284, season: CURRENT_SEASON }
 ];
 
-// cache pentru statistici de echipă
+// cache pentru statistici de echipă și formă recentă
 const teamStatsCache = new Map();
+const teamFormCache = new Map();
 
 // utils
 function formatDate(d) {
@@ -56,7 +57,7 @@ function factorial(n) {
   if (n === 0 || n === 1) return 1;
   if (factCache[n]) return factCache[n];
   let res = 1;
-  for (let i = 2; i <= n; i++) res *= i;
+  for (let i = 2; i <= n; i += 1) res *= i;
   factCache[n] = res;
   return res;
 }
@@ -113,7 +114,7 @@ async function apiFetch(endpoint, params) {
 // wrapper cu retry (3 încercări pe erori 5xx)
 async function apiFetchWithRetry(endpoint, params, retries = 2) {
   let lastError;
-  for (let i = 0; i <= retries; i++) {
+  for (let i = 0; i <= retries; i += 1) {
     try {
       if (i > 0) {
         console.warn(`Retry ${i} pentru ${endpoint}...`);
@@ -149,6 +150,45 @@ async function getTeamStats(leagueId, season, teamId) {
   } catch (e) {
     console.error("Eroare la /teams/statistics:", e.message);
     teamStatsCache.set(key, null);
+    return null;
+  }
+}
+
+// ia forma recentă (ultimele 5 meciuri) pentru o echipă (cu cache)
+async function getTeamRecentForm(leagueId, season, teamId) {
+  const key = `${leagueId}-${season}-${teamId}-recent`;
+  if (teamFormCache.has(key)) return teamFormCache.get(key);
+
+  try {
+    const data = await apiFetchWithRetry("/fixtures", {
+      league: leagueId,
+      season,
+      team: teamId,
+      last: 5
+    });
+
+    const fixtures = data?.response || [];
+    if (!Array.isArray(fixtures) || fixtures.length === 0) {
+      teamFormCache.set(key, null);
+      return null;
+    }
+
+    const lastMatches = fixtures.map((f) => {
+      const isHome = f.teams?.home?.id === teamId;
+      const goalsFor = isHome ? f.goals?.home : f.goals?.away;
+      const goalsAgainst = isHome ? f.goals?.away : f.goals?.home;
+      return {
+        goalsFor: goalsFor ?? 0,
+        goalsAgainst: goalsAgainst ?? 0,
+        home: isHome
+      };
+    });
+
+    teamFormCache.set(key, lastMatches);
+    return lastMatches;
+  } catch (e) {
+    console.error("Eroare la fixtures last pentru echipă:", e.message);
+    teamFormCache.set(key, null);
     return null;
   }
 }
@@ -200,12 +240,42 @@ async function getFixturesForCompetition(comp) {
 // calculează claritatea distribuției (cât de diferit e pick-ul principal de celelalte)
 function computeDistributionClarity(probHome, probDraw, probAway) {
   const vals = [probHome, probDraw, probAway];
-  const sorted = [...vals].sort((a, b) => b - a); // desc
-  const top = sorted[0] / 100;     // în 0–1
-  const second = sorted[1] / 100;  // în 0–1
-  const diff = top - second;       // 0–1
-  const clarity = Math.min(1, diff / 0.4); // saturat la 0.4
+  const sorted = [...vals].sort((a, b) => b - a);
+  const top = sorted[0] / 100;
+  const second = sorted[1] / 100;
+  const diff = top - second;
+  const clarity = Math.min(1, diff / 0.4);
   return Number(clarity.toFixed(2));
+}
+
+// calculează un factor de formă din ultimele meciuri
+function computeFormFactor(lastMatches) {
+  if (!lastMatches || lastMatches.length === 0) {
+    return { attack: 1, defense: 1, matches: 0 };
+  }
+
+  const n = lastMatches.length;
+  let gf = 0;
+  let ga = 0;
+
+  lastMatches.forEach((m) => {
+    gf += m.goalsFor;
+    ga += m.goalsAgainst;
+  });
+
+  const avgGF = gf / n;
+  const avgGA = ga / n;
+
+  const baseGF = 1.3;
+  const baseGA = 1.3;
+
+  let attack = 0.7 + 0.3 * (avgGF / baseGF);
+  let defense = 0.7 + 0.3 * (baseGA / Math.max(avgGA, 0.3));
+
+  attack = clamp(attack, 0.6, 1.4);
+  defense = clamp(defense, 0.6, 1.4);
+
+  return { attack, defense, matches: n };
 }
 
 // calculează un scor de încredere realist (0–100) pe baza datelor
@@ -213,11 +283,14 @@ function buildRealConfidence({ probHome, probDraw, probAway, context }) {
   let dataQuality = 0.3;
   let sampleSize = 0.3;
 
-  if (context && typeof context.homeMatchesTotal === "number" && typeof context.awayMatchesTotal === "number") {
+  if (
+    context &&
+    typeof context.homeMatchesTotal === "number" &&
+    typeof context.awayMatchesTotal === "number"
+  ) {
     const homeMatches = context.homeMatchesTotal;
     const awayMatches = context.awayMatchesTotal;
 
-    // calitatea datelor
     if (homeMatches >= 5 && awayMatches >= 5) {
       dataQuality = 1;
     } else if (homeMatches >= 3 && awayMatches >= 3) {
@@ -226,33 +299,47 @@ function buildRealConfidence({ probHome, probDraw, probAway, context }) {
       dataQuality = 0.4;
     }
 
-    // mărimea eșantionului
     const total = homeMatches + awayMatches;
     sampleSize = Math.min(1, total / 40);
   }
 
+  let recentFactor = 0.3;
+  if (
+    context &&
+    typeof context.homeRecentMatches === "number" &&
+    typeof context.awayRecentMatches === "number"
+  ) {
+    const minRecent = Math.min(context.homeRecentMatches, context.awayRecentMatches);
+    if (minRecent >= 5) recentFactor = 1;
+    else if (minRecent >= 3) recentFactor = 0.7;
+    else if (minRecent >= 1) recentFactor = 0.5;
+    else recentFactor = 0.3;
+  }
+
   const clarity = computeDistributionClarity(probHome, probDraw, probAway);
 
-  // scor total 0–1
   const score =
-    dataQuality * 0.4 +
-    sampleSize * 0.3 +
-    clarity * 0.3;
+    dataQuality * 0.35 +
+    sampleSize * 0.25 +
+    clarity * 0.25 +
+    recentFactor * 0.15;
 
-  const percent = Math.round(score * 100);
+  const scoreClamped = Math.max(0, Math.min(1, score));
+  const percent = Math.round(scoreClamped * 100);
 
   let label = "scăzută";
   if (percent >= 60) label = "ridicată";
   else if (percent >= 40) label = "medie";
 
   return {
-    score: Number(score.toFixed(2)),
+    score: Number(scoreClamped.toFixed(2)),
     percent,
     label,
     components: {
       dataQuality: Number(dataQuality.toFixed(2)),
       sampleSize: Number(sampleSize.toFixed(2)),
-      clarity
+      clarity,
+      recentFactor: Number(recentFactor.toFixed(2))
     }
   };
 }
@@ -263,7 +350,7 @@ function buildPredictionFromLambdas(lambdaHome, lambdaAway, confidenceContext) {
   const pHome = [];
   const pAway = [];
 
-  for (let k = 0; k <= maxGoals; k++) {
+  for (let k = 0; k <= maxGoals; k += 1) {
     pHome[k] = poissonPMF(lambdaHome, k);
     pAway[k] = poissonPMF(lambdaAway, k);
   }
@@ -274,8 +361,8 @@ function buildPredictionFromLambdas(lambdaHome, lambdaAway, confidenceContext) {
   let probOver25 = 0;
   let probBTTS = 0;
 
-  for (let h = 0; h <= maxGoals; h++) {
-    for (let a = 0; a <= maxGoals; a++) {
+  for (let h = 0; h <= maxGoals; h += 1) {
+    for (let a = 0; a <= maxGoals; a += 1) {
       const p = pHome[h] * pAway[a];
 
       if (h > a) probHomeWin += p;
@@ -303,7 +390,6 @@ function buildPredictionFromLambdas(lambdaHome, lambdaAway, confidenceContext) {
 
   const mainPick = probs[0].key;
 
-  // scor de încredere realist, nu doar probabilitatea maximă
   const realConfidence = buildRealConfidence({
     probHome,
     probDraw: probDrawPct,
@@ -311,7 +397,6 @@ function buildPredictionFromLambdas(lambdaHome, lambdaAway, confidenceContext) {
     context: confidenceContext
   });
 
-  // câmpul "confidence" rămâne, dar folosește scorul realist, limitat
   const confidence = clamp(realConfidence.percent, 25, 75);
 
   return {
@@ -336,26 +421,28 @@ function buildPredictionFromLambdas(lambdaHome, lambdaAway, confidenceContext) {
   };
 }
 
-// predicție pentru un fixture
+// predicție pentru un fixture, cu formă recentă
 async function buildPredictionForFixture(comp, fixture) {
   const homeId = fixture.teams?.home?.id;
   const awayId = fixture.teams?.away?.id;
 
-  // fallback implicit
   let lambdaHome = 1.35;
   let lambdaAway = 1.25;
 
-  // context pentru încredere
   let confidenceContext = {
     homeMatchesTotal: 0,
-    awayMatchesTotal: 0
+    awayMatchesTotal: 0,
+    homeRecentMatches: 0,
+    awayRecentMatches: 0
   };
 
   if (homeId && awayId) {
     try {
-      const [homeStats, awayStats] = await Promise.all([
+      const [homeStats, awayStats, homeRecent, awayRecent] = await Promise.all([
         getTeamStats(comp.apiLeagueId, comp.season, homeId),
-        getTeamStats(comp.apiLeagueId, comp.season, awayId)
+        getTeamStats(comp.apiLeagueId, comp.season, awayId),
+        getTeamRecentForm(comp.apiLeagueId, comp.season, homeId),
+        getTeamRecentForm(comp.apiLeagueId, comp.season, awayId)
       ]);
 
       if (homeStats && awayStats) {
@@ -376,19 +463,37 @@ async function buildPredictionForFixture(comp, fixture) {
         lambdaHome = (homeGF + awayGA) / 2;
         lambdaAway = (awayGF + homeGA) / 2;
 
-        lambdaHome *= 1.1; // avantaj teren
+        lambdaHome *= 1.1;
         lambdaAway *= 0.95;
 
         lambdaHome = clamp(lambdaHome, 0.4, 2.8);
         lambdaAway = clamp(lambdaAway, 0.4, 2.8);
 
+        let homeFormFactor = { attack: 1, defense: 1, matches: 0 };
+        let awayFormFactor = { attack: 1, defense: 1, matches: 0 };
+
+        if (homeRecent) {
+          homeFormFactor = computeFormFactor(homeRecent);
+        }
+        if (awayRecent) {
+          awayFormFactor = computeFormFactor(awayRecent);
+        }
+
+        lambdaHome *= homeFormFactor.attack * awayFormFactor.defense;
+        lambdaAway *= awayFormFactor.attack * homeFormFactor.defense;
+
+        lambdaHome = clamp(lambdaHome, 0.4, 3.2);
+        lambdaAway = clamp(lambdaAway, 0.4, 3.2);
+
         confidenceContext = {
           homeMatchesTotal: homeStats.fixtures?.played?.total || 0,
-          awayMatchesTotal: awayStats.fixtures?.played?.total || 0
+          awayMatchesTotal: awayStats.fixtures?.played?.total || 0,
+          homeRecentMatches: homeFormFactor.matches,
+          awayRecentMatches: awayFormFactor.matches
         };
       }
     } catch (e) {
-      console.error("Eroare la calculul lambdas:", e.message);
+      console.error("Eroare la calculul lambdas/formă:", e.message);
     }
   }
 
