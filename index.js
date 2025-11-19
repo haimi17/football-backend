@@ -1,4 +1,4 @@
-// index.js – backend API-FOOTBALL pentru Football Pro Analyzer
+// index.js – backend API-FOOTBALL pentru Football Pro Analyzer (fără cote)
 
 import express from "express";
 import cors from "cors";
@@ -269,7 +269,7 @@ app.get("/api/test-key", (req, res) => {
   });
 });
 
-// status furnizor (nou)
+// status furnizor
 app.get("/api/provider-status", async (req, res) => {
   if (!API_KEY) {
     return res.json({
@@ -309,6 +309,35 @@ app.get("/api/competitions", (req, res) => {
   );
 });
 
+// helper: încearcă întâi fereastra dată, apoi fallback cu "next"
+async function fetchFixturesWithFallback(comp, from, to) {
+  // prima încercare: de la /fixtures cu from/to
+  const mainData = await apiFetchWithRetry("/fixtures", {
+    league: comp.apiLeagueId,
+    season: comp.season,
+    from,
+    to
+  });
+
+  let fixtures = mainData?.response || [];
+  if (Array.isArray(fixtures) && fixtures.length > 0) {
+    return fixtures;
+  }
+
+  console.warn(
+    `Nu s-au găsit fixtures în fereastra ${from}–${to} pentru liga ${comp.name}. Fallback cu "next".`
+  );
+
+  const nextData = await apiFetchWithRetry("/fixtures", {
+    league: comp.apiLeagueId,
+    season: comp.season,
+    next: 30
+  });
+
+  fixtures = nextData?.response || [];
+  return Array.isArray(fixtures) ? fixtures : [];
+}
+
 // meciuri + predicții
 app.get("/api/matches", async (req, res) => {
   const compId = Number(req.query.competitionId);
@@ -330,14 +359,8 @@ app.get("/api/matches", async (req, res) => {
     toDate.setDate(toDate.getDate() + 14);
     const to = formatDate(toDate);
 
-    const fixturesData = await apiFetchWithRetry("/fixtures", {
-      league: comp.apiLeagueId,
-      season: comp.season,
-      from,
-      to
-    });
+    const fixtures = await fetchFixturesWithFallback(comp, from, to);
 
-    const fixtures = fixturesData?.response || [];
     if (!Array.isArray(fixtures) || fixtures.length === 0) {
       return res.json({
         matches: [],
