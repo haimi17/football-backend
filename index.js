@@ -60,7 +60,7 @@ function clamp(x, min, max) {
   return Math.min(max, Math.max(min, x));
 }
 
-// apel generic la API FOOTBALL, cu status în eroare
+// apel generic la API FOOTBALL
 async function apiFetch(endpoint, params) {
   const url = new URL(`${API_BASE}${endpoint}`);
   if (params) {
@@ -111,7 +111,7 @@ async function apiFetchWithRetry(endpoint, params, retries = 2) {
       return await apiFetch(endpoint, params);
     } catch (e) {
       lastError = e;
-      if (e.status && e.status < 500) break; // erori 4xx: nu mai are rost retry
+      if (e.status && e.status < 500) break;
     }
   }
   throw lastError;
@@ -216,7 +216,6 @@ async function buildPredictionForFixture(comp, fixture) {
   const homeId = fixture.teams?.home?.id;
   const awayId = fixture.teams?.away?.id;
 
-  // fallback implicit
   let lambdaHome = 1.35;
   let lambdaAway = 1.25;
 
@@ -245,7 +244,7 @@ async function buildPredictionForFixture(comp, fixture) {
         lambdaHome = (homeGF + awayGA) / 2;
         lambdaAway = (awayGF + homeGA) / 2;
 
-        lambdaHome *= 1.1; // avantaj teren
+        lambdaHome *= 1.1;
         lambdaAway *= 0.95;
 
         lambdaHome = clamp(lambdaHome, 0.4, 2.8);
@@ -309,36 +308,7 @@ app.get("/api/competitions", (req, res) => {
   );
 });
 
-// helper: încearcă întâi fereastra dată, apoi fallback cu "next"
-async function fetchFixturesWithFallback(comp, from, to) {
-  // prima încercare: de la /fixtures cu from/to
-  const mainData = await apiFetchWithRetry("/fixtures", {
-    league: comp.apiLeagueId,
-    season: comp.season,
-    from,
-    to
-  });
-
-  let fixtures = mainData?.response || [];
-  if (Array.isArray(fixtures) && fixtures.length > 0) {
-    return fixtures;
-  }
-
-  console.warn(
-    `Nu s-au găsit fixtures în fereastra ${from}–${to} pentru liga ${comp.name}. Fallback cu "next".`
-  );
-
-  const nextData = await apiFetchWithRetry("/fixtures", {
-    league: comp.apiLeagueId,
-    season: comp.season,
-    next: 30
-  });
-
-  fixtures = nextData?.response || [];
-  return Array.isArray(fixtures) ? fixtures : [];
-}
-
-// meciuri + predicții
+// meciuri + predicții – folosim "next: 30" pentru a lua următoarele meciuri
 app.get("/api/matches", async (req, res) => {
   const compId = Number(req.query.competitionId);
   const comp = COMPETITIONS.find((c) => c.id === compId);
@@ -353,18 +323,17 @@ app.get("/api/matches", async (req, res) => {
   const apiErrors = [];
 
   try {
-    const today = new Date();
-    const from = formatDate(today);
-    const toDate = new Date(today);
-    toDate.setDate(toDate.getDate() + 14);
-    const to = formatDate(toDate);
+    const fixturesData = await apiFetchWithRetry("/fixtures", {
+      league: comp.apiLeagueId,
+      season: comp.season,
+      next: 30
+    });
 
-    const fixtures = await fetchFixturesWithFallback(comp, from, to);
-
+    const fixtures = fixturesData?.response || [];
     if (!Array.isArray(fixtures) || fixtures.length === 0) {
       return res.json({
         matches: [],
-        apiErrors: ["Nu există meciuri programate în perioada cerută"]
+        apiErrors: ["Nu există meciuri programate în perioada următoare"]
       });
     }
 
